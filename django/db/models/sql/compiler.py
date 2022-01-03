@@ -15,12 +15,13 @@ from django.db.models.sql.constants import (
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
+from django.pwt import PwtCompiler, IS_ASYNC
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
 
 
-class SQLCompiler:
+class SQLCompiler(PwtCompiler):
     # Multiline ordering SQL clause may appear from RawSQL.
     ordering_parts = _lazy_re_compile(
         r'^(.*)\s(?:ASC|DESC).*',
@@ -1242,6 +1243,29 @@ class SQLCompiler:
             # unless the database doesn't support it.
             return list(result)
         return result
+
+    if IS_ASYNC:
+        async def execute_sql(self, result_type=MULTI, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):
+            """
+            Run the query against the database and return the result(s). The
+            return value is a single data item if result_type is SINGLE, or an
+            iterator over the results if the result_type is MULTI.
+
+            result_type is either MULTI (use fetchmany() to retrieve all rows),
+            SINGLE (only retrieve a single row), or None. In this last case, the
+            cursor is returned if any query is executed, since it's used by
+            subclasses such as InsertQuery). It's possible, however, that no query
+            is needed, as the filters describe an empty set. In that case, None is
+            returned, to avoid any unnecessary database interaction.
+            """
+            result_type = result_type or NO_RESULTS
+            sql, params = self.as_sql()
+            import psycopg
+            async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
+                async with aconn.cursor() as acur:
+                    await acur.execute(sql, params)
+                    rows = await acur.fetchmany()
+            return [rows]
 
     def as_subquery_condition(self, alias, columns, compiler):
         qn = compiler.quote_name_unless_alias

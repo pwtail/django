@@ -22,6 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
+from django.pwt import IS_ASYNC, InitQuerySet, awrap
 from django.utils import timezone
 from django.utils.functional import cached_property, partition
 
@@ -42,13 +43,23 @@ class BaseIterable:
 class ModelIterable(BaseIterable):
     """Iterable that yields a model instance for each row."""
 
+    _rows = _compiler = None
+
+    def get_rows(self):
+        if self.queryset._rows:
+            return self.queryset._compiler, self.queryset._rows
+        else:
+            id(self)
+        assert not IS_ASYNC
+        queryset = self.queryset
+        compiler = queryset.query.get_compiler(using=queryset.db)
+        results = compiler.execute_sql(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)
+        return compiler, compiler.results_iter(results)
+
     def __iter__(self):
         queryset = self.queryset
         db = queryset.db
-        compiler = queryset.query.get_compiler(using=db)
-        # Execute the query. This will also fill compiler.select, klass_info,
-        # and annotations.
-        results = compiler.execute_sql(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)
+        compiler, rows = self.get_rows()
         select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,
                                                   compiler.annotation_col_map)
         model_cls = klass_info['model']
@@ -65,7 +76,7 @@ class ModelIterable(BaseIterable):
                 for from_field in field.from_fields
             ])) for field, related_objs in queryset._known_related_objects.items()
         ]
-        for row in compiler.results_iter(results):
+        for row in rows:
             obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])
             for rel_populator in related_populators:
                 rel_populator.populate(row, obj)
@@ -172,7 +183,7 @@ class FlatValuesListIterable(BaseIterable):
             yield row[0]
 
 
-class QuerySet:
+class QuerySet(InitQuerySet):
     """Represent a lazy database lookup for a set of objects."""
 
     def __init__(self, model=None, query=None, using=None, hints=None):
@@ -417,7 +428,7 @@ class QuerySet:
 
         return self.query.get_count(using=self.db)
 
-    def get(self, *args, **kwargs):
+    def _get(self, *args, **kwargs):
         """
         Perform the query and return a single object matching the given
         keyword arguments.
@@ -434,6 +445,25 @@ class QuerySet:
         if not clone.query.select_for_update or connections[clone.db].features.supports_select_for_update_with_limit:
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
+        return clone
+
+    def get(self, *args, **kwargs):
+        """
+        Perform the query and return a single object matching the given
+        keyword arguments.
+        """
+        qs = self._get(*args, *args)
+        return qs.get_one()
+
+
+
+    @awrap
+    def get_one(self, *args, **kwargs):
+        """
+        Perform the query and return a single object matching the given
+        keyword arguments.
+        """
+        clone = self
         num = len(clone)
         if num == 1:
             return clone._result_cache[0]
@@ -841,6 +871,7 @@ class QuerySet:
             return obj in self._result_cache
         return self.filter(pk=obj.pk).exists()
 
+    # @use_driver
     def _prefetch_related_objects(self):
         # This method can only be called once the result cache has been filled.
         prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
@@ -1359,7 +1390,7 @@ class QuerySet:
         if self._result_cache is None:
             self._result_cache = list(self._iterable_class(self))
         if self._prefetch_related_lookups and not self._prefetch_done:
-            self._prefetch_related_objects()
+            return self._prefetch_related_objects()
 
     def _next_is_sticky(self):
         """
