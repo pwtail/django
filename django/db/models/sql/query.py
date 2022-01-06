@@ -35,6 +35,7 @@ from django.db.models.sql.datastructures import (
 from django.db.models.sql.where import (
     AND, OR, ExtraWhere, NothingNode, WhereNode,
 )
+from django.pwt import use_driver
 from django.utils.functional import cached_property
 from django.utils.tree import Node
 
@@ -417,6 +418,7 @@ class Query(BaseExpression):
         annotation.set_source_expressions(new_exprs)
         return annotation, col_cnt
 
+    @use_driver
     def get_aggregation(self, using, added_aggregate_names):
         """
         Return the dictionary with the values of the existing aggregations.
@@ -501,7 +503,7 @@ class Query(BaseExpression):
         outer_query.select_for_update = False
         outer_query.select_related = False
         compiler = outer_query.get_compiler(using, elide_empty=elide_empty)
-        result = compiler.execute_sql(SINGLE)
+        result = yield from compiler.G_execute_sql(SINGLE)
         if result is None:
             result = empty_set_result
 

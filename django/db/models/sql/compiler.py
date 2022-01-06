@@ -1264,8 +1264,13 @@ class SQLCompiler:
             async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
                 async with aconn.cursor() as acur:
                     await acur.execute(sql, params)
+                    if result_type == SINGLE:
+                        val = await acur.fetchone()
+                        if val:
+                            return val[0:self.col_count]
+                        return val
                     rows = await acur.fetchmany()
-            return [rows]
+                    return [rows]
 
     G_execute_sql = Stub(execute_sql)
 
