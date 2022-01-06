@@ -22,7 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
-from django.pwt import IS_ASYNC, InitQuerySet, awrap
+from django.pwt import IS_ASYNC, use_driver, Stub
 from django.utils import timezone
 from django.utils.functional import cached_property, partition
 
@@ -183,7 +183,7 @@ class FlatValuesListIterable(BaseIterable):
             yield row[0]
 
 
-class QuerySet(InitQuerySet):
+class QuerySet:
     """Represent a lazy database lookup for a set of objects."""
 
     def __init__(self, model=None, query=None, using=None, hints=None):
@@ -447,18 +447,49 @@ class QuerySet(InitQuerySet):
             clone.query.set_limits(high=limit)
         return clone
 
-    def get(self, *args, **kwargs):
+    _rows = _compiler = None
+
+    def _eval_result_cache(self):
+        if self._result_cache is None:
+            self._result_cache = list(self._iterable_class(self))
+        return self._result_cache
+
+    if IS_ASYNC:
+        async def _eval_result_cache(self):
+            if self._result_cache is not None:
+                return self._result_cache
+            compiler = self.query.get_compiler(using=self.db)
+            chunks = await compiler.execute_sql()
+            self._compiler = compiler
+            [self._rows] = chunks
+            self._result_cache = list(self._iterable_class(self))
+            return self._result_cache
+
+    G_eval_result_cache = Stub(_eval_result_cache)
+
+    #TODO fetch_all?
+    async def _await(self):
+        await self._eval_result_cache()
+        if self._prefetch_related_lookups and not self._prefetch_done:
+            await self._prefetch_related_objects()
+        return self
+
+    def __await__(self):
+        return self._await().__await__()
+
+    async def get(self, *args, **kwargs):
         """
         Perform the query and return a single object matching the given
         keyword arguments.
         """
         qs = self._get(*args, *args)
+        await qs
         return qs.get_one()
 
 
 
-    @awrap
-    def get_one(self, *args, **kwargs):
+    # @awrap
+    def get_one(self):
         """
         Perform the query and return a single object matching the given
         keyword arguments.
@@ -472,6 +503,7 @@ class QuerySet(InitQuerySet):
                 "%s matching query does not exist." %
                 self.model._meta.object_name
             )
+        #FIXME
         raise self.model.MultipleObjectsReturned(
             'get() returned more than one %s -- it returned %s!' % (
                 self.model._meta.object_name,
@@ -871,10 +903,10 @@ class QuerySet(InitQuerySet):
             return obj in self._result_cache
         return self.filter(pk=obj.pk).exists()
 
-    # @use_driver
+    @use_driver
     def _prefetch_related_objects(self):
         # This method can only be called once the result cache has been filled.
-        prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
+        yield from prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
         self._prefetch_done = True
 
     def explain(self, *, format=None, **options):
@@ -1796,7 +1828,7 @@ def prefetch_related_objects(model_instances, *related_lookups):
                 obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
 
             if obj_to_fetch:
-                obj_list, additional_lookups = prefetch_one_level(
+                obj_list, additional_lookups = yield from prefetch_one_level(
                     obj_to_fetch,
                     prefetcher,
                     lookup,
@@ -1938,6 +1970,7 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
         # for performance reasons.
         rel_qs._prefetch_related_lookups = ()
 
+    ret = yield from rel_qs.G_eval_result_cache()
     all_related_objects = list(rel_qs)
 
     rel_obj_cache = {}
