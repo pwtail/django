@@ -46,7 +46,7 @@ class ModelIterable(BaseIterable):
     _rows = _compiler = None
 
     def get_rows(self):
-        if self.queryset._rows:
+        if self.queryset._rows is not None:
             return self.queryset._compiler, self.queryset._rows
         else:
             id(self)
