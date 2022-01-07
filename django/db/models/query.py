@@ -22,7 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
-from django.pwt import IS_ASYNC, use_driver, Stub
+from django.pwt import IS_ASYNC, use_driver
 from django.utils import timezone
 from django.utils.functional import cached_property, partition
 
@@ -465,7 +465,7 @@ class QuerySet:
             self._result_cache = list(self._iterable_class(self))
             return self._result_cache
 
-    G_eval_result_cache = Stub(_eval_result_cache)
+    # G_eval_result_cache = Stub(_eval_result_cache)
 
     #TODO fetch_all?
     async def _await(self):
@@ -1970,7 +1970,7 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
         # for performance reasons.
         rel_qs._prefetch_related_lookups = ()
 
-    ret = yield from rel_qs.G_eval_result_cache()
+    yield rel_qs._eval_result_cache, ()
     all_related_objects = list(rel_qs)
 
     rel_obj_cache = {}

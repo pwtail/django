@@ -503,7 +503,7 @@ class Query(BaseExpression):
         outer_query.select_for_update = False
         outer_query.select_related = False
         compiler = outer_query.get_compiler(using, elide_empty=elide_empty)
-        result = yield from compiler.G_execute_sql(SINGLE)
+        result = yield compiler.execute_sql, (SINGLE,)
         if result is None:
             result = empty_set_result
 

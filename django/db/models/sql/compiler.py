@@ -15,7 +15,7 @@ from django.db.models.sql.constants import (
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
-from django.pwt import IS_ASYNC, Stub
+from django.pwt import IS_ASYNC
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
@@ -1272,7 +1272,7 @@ class SQLCompiler:
                     rows = await acur.fetchmany()
                     return [rows]
 
-    G_execute_sql = Stub(execute_sql)
+    # G_execute_sql = Stub(execute_sql)
 
     def as_subquery_condition(self, alias, columns, compiler):
         qn = compiler.quote_name_unless_alias
