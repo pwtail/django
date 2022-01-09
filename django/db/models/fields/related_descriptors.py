@@ -79,6 +79,7 @@ class ForeignKeyDeferredAttribute(DeferredAttribute):
             self.field.delete_cached_value(instance)
         instance.__dict__[self.field.attname] = value
 
+
 @dataclass
 class LazyField:
     descriptor: object
