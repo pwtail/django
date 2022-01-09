@@ -1272,8 +1272,6 @@ class SQLCompiler:
                     rows = await acur.fetchmany()
                     return [rows]
 
-    # G_execute_sql = Stub(execute_sql)
-
     def as_subquery_condition(self, alias, columns, compiler):
         qn = compiler.quote_name_unless_alias
         qn2 = self.connection.ops.quote_name

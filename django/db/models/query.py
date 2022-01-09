@@ -43,61 +43,13 @@ class BaseIterable:
 class ModelIterable(BaseIterable):
     """Iterable that yields a model instance for each row."""
 
-    _rows = _compiler = None
-
-    def get_rows(self):
-        if self.queryset._rows is not None:
-            return self.queryset._compiler, self.queryset._rows
-        else:
-            id(self)
-        assert not IS_ASYNC
+    def __iter__(self):
         queryset = self.queryset
         compiler = queryset.query.get_compiler(using=queryset.db)
         results = compiler.execute_sql(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)
-        return compiler, compiler.results_iter(results)
+        rows = compiler.results_iter(results)
+        yield from queryset.make_objects(compiler, rows)
 
-    def __iter__(self):
-        queryset = self.queryset
-        db = queryset.db
-        compiler, rows = self.get_rows()
-        select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,
-                                                  compiler.annotation_col_map)
-        model_cls = klass_info['model']
-        select_fields = klass_info['select_fields']
-        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
-        init_list = [f[0].target.attname
-                     for f in select[model_fields_start:model_fields_end]]
-        related_populators = get_related_populators(klass_info, select, db)
-        known_related_objects = [
-            (field, related_objs, operator.attrgetter(*[
-                field.attname
-                if from_field == 'self' else
-                queryset.model._meta.get_field(from_field).attname
-                for from_field in field.from_fields
-            ])) for field, related_objs in queryset._known_related_objects.items()
-        ]
-        for row in rows:
-            obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])
-            for rel_populator in related_populators:
-                rel_populator.populate(row, obj)
-            if annotation_col_map:
-                for attr_name, col_pos in annotation_col_map.items():
-                    setattr(obj, attr_name, row[col_pos])
-
-            # Add the known related objects to the model.
-            for field, rel_objs, rel_getter in known_related_objects:
-                # Avoid overwriting objects loaded by, e.g., select_related().
-                if field.is_cached(obj):
-                    continue
-                rel_obj_id = rel_getter(obj)
-                try:
-                    rel_obj = rel_objs[rel_obj_id]
-                except KeyError:
-                    pass  # May happen in qs1 | qs2 scenarios.
-                else:
-                    setattr(obj, field.name, rel_obj)
-
-            yield obj
 
 
 class ValuesIterable(BaseIterable):
@@ -366,8 +318,57 @@ class QuerySet:
     # METHODS THAT DO DATABASE QUERIES #
     ####################################
 
+    #TODO remove iteration
     def _iterator(self, use_chunked_fetch, chunk_size):
         yield from self._iterable_class(self, chunked_fetch=use_chunked_fetch, chunk_size=chunk_size)
+
+    async def _aiterator(self, use_chunked_fetch, chunk_size):
+        #cursor here
+        self._rows = await self._fetch_rows()
+
+
+    def make_objects(self, compiler, rows):
+        queryset = self
+        db = queryset.db
+        select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,
+                                                  compiler.annotation_col_map)
+        model_cls = klass_info['model']
+        select_fields = klass_info['select_fields']
+        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
+        init_list = [f[0].target.attname
+                     for f in select[model_fields_start:model_fields_end]]
+        related_populators = get_related_populators(klass_info, select, db)
+        known_related_objects = [
+            (field, related_objs, operator.attrgetter(*[
+                field.attname
+                if from_field == 'self' else
+                queryset.model._meta.get_field(from_field).attname
+                for from_field in field.from_fields
+            ])) for field, related_objs in queryset._known_related_objects.items()
+        ]
+        for row in rows:
+            obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])
+            for rel_populator in related_populators:
+                rel_populator.populate(row, obj)
+            if annotation_col_map:
+                for attr_name, col_pos in annotation_col_map.items():
+                    setattr(obj, attr_name, row[col_pos])
+
+            # Add the known related objects to the model.
+            for field, rel_objs, rel_getter in known_related_objects:
+                # Avoid overwriting objects loaded by, e.g., select_related().
+                if field.is_cached(obj):
+                    continue
+                rel_obj_id = rel_getter(obj)
+                try:
+                    rel_obj = rel_objs[rel_obj_id]
+                except KeyError:
+                    pass  # May happen in qs1 | qs2 scenarios.
+                else:
+                    setattr(obj, field.name, rel_obj)
+
+            yield obj
+
 
     def iterator(self, chunk_size=2000):
         """
@@ -447,8 +448,6 @@ class QuerySet:
             clone.query.set_limits(high=limit)
         return clone
 
-    _rows = _compiler = None
-
     def _eval_result_cache(self):
         if self._result_cache is None:
             self._result_cache = list(self._iterable_class(self))
@@ -459,13 +458,9 @@ class QuerySet:
             if self._result_cache is not None:
                 return self._result_cache
             compiler = self.query.get_compiler(using=self.db)
-            chunks = await compiler.execute_sql()
-            self._compiler = compiler
-            [self._rows] = chunks
-            self._result_cache = list(self._iterable_class(self))
+            [rows] = await compiler.execute_sql()
+            self._result_cache = list(self.make_objects(compiler, rows))
             return self._result_cache
-
-    # G_eval_result_cache = Stub(_eval_result_cache)
 
     #TODO fetch_all?
     async def _await(self):
