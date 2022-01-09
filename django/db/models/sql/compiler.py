@@ -1274,6 +1274,8 @@ class SQLCompiler:
                                 yield rows
                 return agen()
 
+            assert not chunked_fetch
+
             async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
                 async with aconn.cursor() as acur:
                     await acur.execute(sql, params)
@@ -1282,7 +1284,7 @@ class SQLCompiler:
                         if val:
                             return val[0:self.col_count]
                         return val
-                    [rows] = await acur.fetchmany()
+                    rows = await acur.fetchmany()
                     return [rows]
 
     def as_subquery_condition(self, alias, columns, compiler):

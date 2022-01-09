@@ -477,7 +477,7 @@ class QuerySet:
         Perform the query and return a single object matching the given
         keyword arguments.
         """
-        qs = self._get(*args, *args)
+        qs = self._get(*args, **kwargs)
         await qs
         return qs.get_one()
 
