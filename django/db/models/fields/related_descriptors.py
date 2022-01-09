@@ -62,6 +62,7 @@ and two directions (forward and reverse) for a total of six combinations.
    If you're looking for ``ForwardManyToManyDescriptor`` or
    ``ReverseManyToManyDescriptor``, use ``ManyToManyDescriptor`` instead.
 """
+from dataclasses import dataclass
 
 from django.core.exceptions import FieldError
 from django.db import connections, router, transaction
@@ -77,6 +78,15 @@ class ForeignKeyDeferredAttribute(DeferredAttribute):
         if instance.__dict__.get(self.field.attname) != value and self.field.is_cached(instance):
             self.field.delete_cached_value(instance)
         instance.__dict__[self.field.attname] = value
+
+@dataclass
+class LazyField:
+    descriptor: object
+    instance: object
+
+    def __await__(self):
+        co = self.descriptor.get_object(self.instance)
+        return co.__await__()
 
 
 class ForwardManyToOneDescriptor:
@@ -184,6 +194,7 @@ class ForwardManyToOneDescriptor:
             else:
                 rel_obj = None
             if rel_obj is None and has_value:
+                return LazyField(self, instance)
                 rel_obj = self.get_object(instance)
                 remote_field = self.field.remote_field
                 # If this is a one-to-one relation, set the reverse accessor
