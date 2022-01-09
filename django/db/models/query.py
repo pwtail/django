@@ -318,14 +318,15 @@ class QuerySet:
     # METHODS THAT DO DATABASE QUERIES #
     ####################################
 
-    #TODO remove iteration
     def _iterator(self, use_chunked_fetch, chunk_size):
         yield from self._iterable_class(self, chunked_fetch=use_chunked_fetch, chunk_size=chunk_size)
 
-    async def _aiterator(self, use_chunked_fetch, chunk_size):
-        #cursor here
-        self._rows = await self._fetch_rows()
-
+    if IS_ASYNC:
+        async def _iterator(self, use_chunked_fetch, chunk_size):
+            compiler = self.query.get_compiler(using=self.db)
+            aiter = await compiler.execute_sql(chunked_fetch=use_chunked_fetch, chunk_size=chunk_size)
+            async for rows in aiter:
+                yield list(self.make_objects(compiler, rows))
 
     def make_objects(self, compiler, rows):
         queryset = self
@@ -368,7 +369,6 @@ class QuerySet:
                     setattr(obj, field.name, rel_obj)
 
             yield obj
-
 
     def iterator(self, chunk_size=2000):
         """

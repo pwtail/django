@@ -1261,6 +1261,19 @@ class SQLCompiler:
             result_type = result_type or NO_RESULTS
             sql, params = self.as_sql()
             import psycopg
+
+            if chunked_fetch:
+                async def agen():
+                    async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
+                        async with aconn.cursor() as acur:
+                            await acur.execute(sql, params)
+                            while True:
+                                rows = await acur.fetchmany(size=chunk_size)
+                                if not rows:
+                                    break
+                                yield rows
+                return agen()
+
             async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
                 async with aconn.cursor() as acur:
                     await acur.execute(sql, params)
@@ -1269,7 +1282,7 @@ class SQLCompiler:
                         if val:
                             return val[0:self.col_count]
                         return val
-                    rows = await acur.fetchmany()
+                    [rows] = await acur.fetchmany()
                     return [rows]
 
     def as_subquery_condition(self, alias, columns, compiler):
