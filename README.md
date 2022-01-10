@@ -50,9 +50,11 @@ class Query:
 
 ```
 
+Look at the `hit_the_db` function. It yields a tuple: `(function, args, kwargs)`. That is a call that will be made. The function should be synchronous in the case of synchronous service and asynchronous otherwise.
+
 The `@use_driver` decorator means that a specific database driver (sync or async) will be used to execute it, turning a generator into a function.
 
-What we get is `Query.fetch` that will be a regular function or will return a coroutine, depending on the `IS_ASYNC` constant (just like `execute_sql`).
+As a result, `Query.fetch` will be a regular function or will return a coroutine, depending on the `IS_ASYNC` constant (just like `execute_sql`).
 
 **Other tricks**
 
