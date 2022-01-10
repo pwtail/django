@@ -13,7 +13,7 @@ The sync mode remains first class, no adapters needed.
 
 The fact that it is django-based means the API is stable and all tests from django can be reused.
 
-**How it works**
+**How it works. Approach #1: yield from**
 
 I have found recently a more or less universal way to make a library usable in both sync and async contexts. It is done by using generators and `yield from`.
 Let me demonstrate it on a simple example. Suppose we have a `SQLCompiler` class as shown below.
