@@ -481,9 +481,6 @@ class QuerySet:
         await qs
         return qs.get_one()
 
-
-
-    # @awrap
     def get_one(self):
         """
         Perform the query and return a single object matching the given
