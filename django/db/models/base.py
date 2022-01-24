@@ -38,6 +38,8 @@ from django.utils.hashable import make_hashable
 from django.utils.text import capfirst, get_text_list
 from django.utils.translation import gettext_lazy as _
 
+from django.pwt import use_driver, IS_ASYNC
+
 
 class Deferred:
     def __repr__(self):
@@ -705,8 +707,8 @@ class Model(metaclass=ModelBase):
             return getattr(self, field_name)
         return getattr(self, field.attname)
 
-    def save(self, force_insert=False, force_update=False, using=None,
-             update_fields=None):
+    async def G_save(self, force_insert=False, force_update=False, using=None,
+                     update_fields=None):
         """
         Save the current instance. Override this in a subclass if you want to
         control the saving process.
@@ -759,12 +761,15 @@ class Model(metaclass=ModelBase):
             if loaded_fields:
                 update_fields = frozenset(loaded_fields)
 
-        self.save_base(using=using, force_insert=force_insert,
-                       force_update=force_update, update_fields=update_fields)
+        await self.G_save_base(using=using, force_insert=force_insert,
+                                    force_update=force_update, update_fields=update_fields)
+
+    # save = use_driver(G_save)
+    save = G_save
     save.alters_data = True
 
-    def save_base(self, raw=False, force_insert=False,
-                  force_update=False, using=None, update_fields=None):
+    async def G_save_base(self, raw=False, force_insert=False,
+                    force_update=False, using=None, update_fields=None):
         """
         Handle the parts of saving which should be done only once per save,
         yet need to be done in raw saves, too. This includes some sanity
@@ -795,8 +800,8 @@ class Model(metaclass=ModelBase):
         with context_manager:
             parent_inserted = False
             if not raw:
-                parent_inserted = self._save_parents(cls, using, update_fields)
-            updated = self._save_table(
+                parent_inserted = await self._G_save_parents(cls, using, update_fields)
+            updated = await self._G_save_table(
                 raw, cls, force_insert or parent_inserted,
                 force_update, using, update_fields,
             )
@@ -812,9 +817,10 @@ class Model(metaclass=ModelBase):
                 update_fields=update_fields, raw=raw, using=using,
             )
 
+    save_base = use_driver(G_save_base)
     save_base.alters_data = True
 
-    def _save_parents(self, cls, using, update_fields):
+    async def _G_save_parents(self, cls, using, update_fields):
         """Save all the parents of cls using values from self."""
         meta = cls._meta
         inserted = False
@@ -823,8 +829,8 @@ class Model(metaclass=ModelBase):
             if (field and getattr(self, parent._meta.pk.attname) is None and
                     getattr(self, field.attname) is not None):
                 setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
-            parent_inserted = self._save_parents(cls=parent, using=using, update_fields=update_fields)
-            updated = self._save_table(
+            parent_inserted = await self._G_save_parents(cls=parent, using=using, update_fields=update_fields)
+            updated = await self._G_save_table(
                 cls=parent, using=using, update_fields=update_fields,
                 force_insert=parent_inserted,
             )
@@ -842,8 +848,10 @@ class Model(metaclass=ModelBase):
                     field.delete_cached_value(self)
         return inserted
 
-    def _save_table(self, raw=False, cls=None, force_insert=False,
-                    force_update=False, using=None, update_fields=None):
+    # _save_parents = use_driver(_G_save_parents)
+
+    async def _G_save_table(self, raw=False, cls=None, force_insert=False,
+                      force_update=False, using=None, update_fields=None):
         """
         Do the heavy-lifting involved in saving. Update or insert the data
         for a single table.
@@ -878,8 +886,8 @@ class Model(metaclass=ModelBase):
             values = [(f, None, (getattr(self, f.attname) if raw else f.pre_save(self, False)))
                       for f in non_pks]
             forced_update = update_fields or force_update
-            updated = self._do_update(base_qs, using, pk_val, values, update_fields,
-                                      forced_update)
+            updated = await self._G_do_update(base_qs, using, pk_val, values, update_fields,
+                                                   forced_update)
             if force_update and not updated:
                 raise DatabaseError("Forced update did not affect any rows.")
             if update_fields and not updated:
@@ -901,13 +909,13 @@ class Model(metaclass=ModelBase):
                 fields = [f for f in fields if f is not meta.auto_field]
 
             returning_fields = meta.db_returning_fields
-            results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+            results = await self._G_do_insert(cls._base_manager, using, fields, returning_fields, raw)
             if results:
                 for value, field in zip(results[0], returning_fields):
                     setattr(self, field.attname, value)
         return updated
 
-    def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):
+    async def _G_do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):
         """
         Try to update the model. Return True if the model was updated (if an
         update query was done and a matching row was found in the DB).
@@ -919,10 +927,11 @@ class Model(metaclass=ModelBase):
             # case we just say the update succeeded. Another case ending up here
             # is a model with just PK - in that case check that the PK still
             # exists.
-            return update_fields is not None or filtered.exists()
+            return update_fields is not None or await filtered.exists()
         if self._meta.select_on_save and not forced_update:
+            # TODO TODO check
             return (
-                filtered.exists() and
+                await filtered.exists() and
                 # It may happen that the object is deleted from the DB right after
                 # this check, causing the subsequent UPDATE to return zero matching
                 # rows. The same result can occur in some rare cases when the
@@ -930,16 +939,16 @@ class Model(metaclass=ModelBase):
                 # successfully (a row is matched and updated). In order to
                 # distinguish these two cases, the object's existence in the
                 # database is again checked for if the UPDATE query returns 0.
-                (filtered._update(values) > 0 or filtered.exists())
+                (await filtered._update(values) > 0 or await filtered.exists())
             )
-        return filtered._update(values) > 0
+        return (await filtered._update(values)) > 0
 
-    def _do_insert(self, manager, using, fields, returning_fields, raw):
+    async def _G_do_insert(self, manager, using, fields, returning_fields, raw):
         """
         Do an INSERT. If returning_fields is defined then this method should
         return the newly created data for the model.
         """
-        return manager._insert(
+        return await manager._insert(
             [self], fields=fields, returning_fields=returning_fields,
             using=using, raw=raw,
         )

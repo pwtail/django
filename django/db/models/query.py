@@ -851,7 +851,7 @@ class QuerySet:
         return rows
     update.alters_data = True
 
-    def _update(self, values):
+    async def _update(self, values):
         """
         A version of update() that accepts field objects instead of field names.
         Used primarily for model saving and not intended for use by general
@@ -865,13 +865,13 @@ class QuerySet:
         # Clear any annotations so that they won't be present in subqueries.
         query.annotations = {}
         self._result_cache = None
-        return query.get_compiler(self.db).execute_sql(CURSOR)
+        return await query.get_compiler(self.db).execute_sql(CURSOR)
     _update.alters_data = True
     _update.queryset_only = False
 
     def exists(self):
         if self._result_cache is None:
-            return self.query.has_results(using=self.db)
+            return (yield from self.query.has_results(using=self.db))
         return bool(self._result_cache)
 
     def contains(self, obj):
@@ -1348,7 +1348,7 @@ class QuerySet:
     # PRIVATE METHODS #
     ###################
 
-    def _insert(self, objs, fields, returning_fields=None, raw=False, using=None, ignore_conflicts=False):
+    async def _insert(self, objs, fields, returning_fields=None, raw=False, using=None, ignore_conflicts=False):
         """
         Insert a new record for the given model. This provides an interface to
         the InsertQuery class and is how Model.save() is implemented.
@@ -1358,7 +1358,7 @@ class QuerySet:
             using = self.db
         query = sql.InsertQuery(self.model, ignore_conflicts=ignore_conflicts)
         query.insert_values(fields, objs, raw=raw)
-        return query.get_compiler(using=using).execute_sql(returning_fields)
+        return await query.get_compiler(using=using).execute_sql(returning_fields)
     _insert.alters_data = True
     _insert.queryset_only = False
 

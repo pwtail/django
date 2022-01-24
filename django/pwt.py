@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import typing
+from contextlib import contextmanager, asynccontextmanager
 from functools import wraps, cached_property
 
 if typing.TYPE_CHECKING:
@@ -11,6 +12,14 @@ class DeferredCall(typing.NamedTuple):
     func: object
     args: tuple
     kwargs: dict
+
+
+#TODO
+class Si:
+    def execute(self, g):
+        result = None
+        while 1:
+            result = g.send(result)
 
 
 class SyncDriver:
@@ -36,6 +45,8 @@ class SyncDriver:
 
 
 sync_driver = SyncDriver()
+
+#TODO G_func = unwrapped(func)
 
 class AsyncDriver:
 
@@ -65,7 +76,9 @@ async_driver = AsyncDriver()
 IS_ASYNC = True
 
 
+#TODO tofunc
 def use_driver(func):
+    @wraps(func)
     def wrapper(*args, **kwargs):
         deferred_calls = func(*args, **kwargs)
         if not IS_ASYNC:
@@ -74,5 +87,13 @@ def use_driver(func):
             driver = async_driver
         return driver.execute(deferred_calls)
 
+    wrapper.wraps = func
     return wrapper
 
+
+
+class RetCursor(typing.NamedTuple):
+    rowcount: int
+
+    def close(self):
+        pass

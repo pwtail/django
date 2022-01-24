@@ -548,7 +548,7 @@ class Query(BaseExpression):
     def has_results(self, using):
         q = self.exists(using)
         compiler = q.get_compiler(using=using)
-        return compiler.has_results()
+        return (yield from compiler.has_results())
 
     def explain(self, using, format=None, **options):
         q = self.clone()
