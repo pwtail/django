@@ -15,6 +15,7 @@ from django.db.models.sql.constants import (
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
+from django.pwt import Branch, RetCursor
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
@@ -1153,30 +1154,46 @@ class SQLCompiler:
                     converters[i] = (backend_converters + field_converters, expression)
         return converters
 
-    def apply_converters(self, rows, converters):
+    # def apply_converters(self, rows, converters):
+    #     connection = self.connection
+    #     converters = list(converters.items())
+    #     for row in map(list, rows):
+    #         for pos, (convs, expression) in converters:
+    #             value = row[pos]
+    #             for converter in convs:
+    #                 value = converter(value, expression, connection)
+    #             row[pos] = value
+    #         yield row
+
+    def apply_converters_(self, rows):
+        fields = [s[0] for s in self.select[0:self.col_count]]
+        converters = self.get_converters(fields)
+        if not converters:
+            return rows
         connection = self.connection
         converters = list(converters.items())
-        for row in map(list, rows):
+        rows = [list(row) for row in rows]
+        for row in rows:
             for pos, (convs, expression) in converters:
                 value = row[pos]
                 for converter in convs:
                     value = converter(value, expression, connection)
                 row[pos] = value
-            yield row
-
-    def results_iter(self, results=None, tuple_expected=False, chunked_fetch=False,
-                     chunk_size=GET_ITERATOR_CHUNK_SIZE):
-        """Return an iterator over the results from executing this query."""
-        if results is None:
-            results = self.execute_sql(MULTI, chunked_fetch=chunked_fetch, chunk_size=chunk_size)
-        fields = [s[0] for s in self.select[0:self.col_count]]
-        converters = self.get_converters(fields)
-        rows = chain.from_iterable(results)
-        if converters:
-            rows = self.apply_converters(rows, converters)
-            if tuple_expected:
-                rows = map(tuple, rows)
         return rows
+
+    # def results_iter(self, results=None, tuple_expected=False, chunked_fetch=False,
+    #                  chunk_size=GET_ITERATOR_CHUNK_SIZE):
+    #     """Return an iterator over the results from executing this query."""
+    #     if results is None:
+    #         results = self.execute_sql(MULTI, chunked_fetch=chunked_fetch, chunk_size=chunk_size)
+    #     fields = [s[0] for s in self.select[0:self.col_count]]
+    #     converters = self.get_converters(fields)
+    #     rows = chain.from_iterable(results)
+    #     if converters:
+    #         rows = self.apply_converters(rows, converters)
+    #         if tuple_expected:
+    #             rows = map(tuple, rows)
+    #     return rows
 
     def has_results(self):
         """
@@ -1185,7 +1202,10 @@ class SQLCompiler:
         """
         return bool(self.execute_sql(SINGLE))
 
-    def execute_sql(self, result_type=MULTI, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):
+    branch = Branch()
+
+    @branch
+    def execute_sql(self, result_type=MULTI):
         """
         Run the query against the database and return the result(s). The
         return value is a single data item if result_type is SINGLE, or an
@@ -1208,10 +1228,8 @@ class SQLCompiler:
                 return iter([])
             else:
                 return
-        if chunked_fetch:
-            cursor = self.connection.chunked_cursor()
-        else:
-            cursor = self.connection.cursor()
+        cursor = self.connection.cursor()
+        #FIXME always close
         try:
             cursor.execute(sql, params)
         except Exception:
@@ -1234,19 +1252,39 @@ class SQLCompiler:
         if result_type == NO_RESULTS:
             cursor.close()
             return
+        rows = cursor.fetchall()
+        return rows
 
-        result = cursor_iter(
-            cursor, self.connection.features.empty_fetchmany_value,
-            self.col_count if self.has_extra_select else None,
-            chunk_size,
-        )
-        if not chunked_fetch or not self.connection.features.can_use_chunked_reads:
-            # If we are using non-chunked reads, we return the same data
-            # structure as normally, but ensure it is all read into memory
-            # before going any further. Use chunked_fetch if requested,
-            # unless the database doesn't support it.
-            return list(result)
-        return result
+    @branch
+    async def execute_sql(self, result_type=MULTI):
+        """
+        Run the query against the database and return the result(s). The
+        return value is a single data item if result_type is SINGLE, or an
+        iterator over the results if the result_type is MULTI.
+
+        result_type is either MULTI (use fetchmany() to retrieve all rows),
+        SINGLE (only retrieve a single row), or None. In this last case, the
+        cursor is returned if any query is executed, since it's used by
+        subclasses such as InsertQuery). It's possible, however, that no query
+        is needed, as the filters describe an empty set. In that case, None is
+        returned, to avoid any unnecessary database interaction.
+        """
+        result_type = result_type or NO_RESULTS
+        sql, params = self.as_sql()
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(sql, params)
+                if result_type == SINGLE:
+                    val = await acur.fetchone()
+                    if val:
+                        return val[0:self.col_count]
+                    return val
+                elif result_type == CURSOR:
+                    return RetCursor(acur.rowcount)
+                rows = await acur.fetchall()
+                return rows
 
     def as_subquery_condition(self, alias, columns, compiler):
         qn = compiler.quote_name_unless_alias
