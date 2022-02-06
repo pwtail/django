@@ -4,7 +4,7 @@ import inspect
 #TODO threadlocal
 import typing
 
-IS_ASYNC = False
+IS_ASYNC = True
 
 def is_async():
     return IS_ASYNC
@@ -43,11 +43,11 @@ class RetCursor(typing.NamedTuple):
 
 
 def wait(fn):
+    if not is_async():
+        return fn
     assert not inspect.iscoroutinefunction(fn)
     sig = inspect.signature(fn)
     kwargs = {k: v.default for k, v in sig.parameters.items()}
-    if not is_async():
-        return lambda: fn(**kwargs)
 
     async def wrapper():
         for key, value in tuple(kwargs.items()):

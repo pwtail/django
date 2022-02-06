@@ -15,7 +15,7 @@ from django.db.models.sql.constants import (
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
-from django.pwt import Branch, RetCursor
+from django.pwt import Branch, RetCursor, wait
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
@@ -1200,7 +1200,12 @@ class SQLCompiler:
         Backends (e.g. NoSQL) can override this in order to use optimized
         versions of "query has any results."
         """
-        return bool(self.execute_sql(SINGLE))
+        result = self.execute_sql(SINGLE)
+
+        @wait
+        def ret(result=result):
+            return bool(result)
+        return ret()
 
     branch = Branch()
 
@@ -1638,26 +1643,26 @@ class SQLUpdateCompiler(SQLCompiler):
             result.append('WHERE %s' % where)
         return ' '.join(result), tuple(update_params + params)
 
-    def execute_sql(self, result_type):
-        """
-        Execute the specified update. Return the number of rows affected by
-        the primary update query. The "primary update query" is the first
-        non-empty query that is executed. Row counts for any subsequent,
-        related queries are not available.
-        """
-        cursor = super().execute_sql(result_type)
-        try:
-            rows = cursor.rowcount if cursor else 0
-            is_empty = cursor is None
-        finally:
-            if cursor:
-                cursor.close()
-        for query in self.query.get_related_updates():
-            aux_rows = query.get_compiler(self.using).execute_sql(result_type)
-            if is_empty and aux_rows:
-                rows = aux_rows
-                is_empty = False
-        return rows
+    # def execute_sql(self, result_type):
+    #     """
+    #     Execute the specified update. Return the number of rows affected by
+    #     the primary update query. The "primary update query" is the first
+    #     non-empty query that is executed. Row counts for any subsequent,
+    #     related queries are not available.
+    #     """
+    #     cursor = super().execute_sql(result_type)
+    #     try:
+    #         rows = cursor.rowcount if cursor else 0
+    #         is_empty = cursor is None
+    #     finally:
+    #         if cursor:
+    #             cursor.close()
+    #     # for query in self.query.get_related_updates():
+    #     #     aux_rows = query.get_compiler(self.using).execute_sql(result_type)
+    #     #     if is_empty and aux_rows:
+    #     #         rows = aux_rows
+    #     #         is_empty = False
+    #     return rows
 
     def pre_sql_setup(self):
         """

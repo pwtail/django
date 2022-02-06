@@ -22,7 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
-from django.pwt import is_async
+from django.pwt import is_async, wait
 from django.utils import timezone
 from django.utils.deprecation import RemovedInDjango50Warning
 from django.utils.functional import cached_property, partition
@@ -419,20 +419,27 @@ class _QuerySet:
         if not clone.query.select_for_update or connections[clone.db].features.supports_select_for_update_with_limit:
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
-        num = len(clone)
-        if num == 1:
-            return clone._result_cache[0]
-        if not num:
-            raise self.model.DoesNotExist(
-                "%s matching query does not exist." %
-                self.model._meta.object_name
+
+        _ = clone._fetch_all()
+
+        @wait()
+        def run(_=_):
+            num = len(clone._result_cache)
+            if num == 1:
+                return clone._result_cache[0]
+            if not num:
+                raise self.model.DoesNotExist(
+                    "%s matching query does not exist." %
+                    self.model._meta.object_name
+                )
+            raise self.model.MultipleObjectsReturned(
+                'get() returned more than one %s -- it returned %s!' % (
+                    self.model._meta.object_name,
+                    num if not limit or num < limit else 'more than %s' % (limit - 1),
+                )
             )
-        raise self.model.MultipleObjectsReturned(
-            'get() returned more than one %s -- it returned %s!' % (
-                self.model._meta.object_name,
-                num if not limit or num < limit else 'more than %s' % (limit - 1),
-            )
-        )
+
+        return run()
 
     def create(self, **kwargs):
         """
@@ -853,10 +860,14 @@ class _QuerySet:
         query.add_update_values(kwargs)
         # Clear any annotations so that they won't be present in subqueries.
         query.annotations = {}
-        with transaction.mark_for_rollback_on_error(using=self.db):
-            rows = query.get_compiler(self.db).execute_sql(CURSOR)
-        self._result_cache = None
-        return rows
+        # with transaction.mark_for_rollback_on_error(using=self.db):
+        cursor = query.get_compiler(self.db).execute_sql(CURSOR)
+
+        @wait
+        def run(cursor=cursor):
+            return cursor.rowcount
+            self._result_cache = None
+        return run()
     update.alters_data = True
 
     def _update(self, values):
