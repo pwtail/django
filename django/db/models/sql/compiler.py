@@ -4,6 +4,7 @@ import re
 from functools import partial
 from itertools import chain
 
+from django import pwt
 from django.core.exceptions import EmptyResultSet, FieldError
 from django.db import DatabaseError, NotSupportedError
 from django.db.models.constants import LOOKUP_SEP
@@ -15,6 +16,7 @@ from django.db.models.sql.constants import (
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
+from django.pwt import IS_ASYNC, RetCursor
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
@@ -1173,12 +1175,13 @@ class SQLCompiler:
                 rows = map(tuple, rows)
         return rows
 
-    def has_results(self):
+    async def has_results(self):
         """
         Backends (e.g. NoSQL) can override this in order to use optimized
         versions of "query has any results."
         """
-        return bool(self.execute_sql(SINGLE))
+        val = await self.execute_sql(SINGLE,)
+        return bool(val)
 
     def execute_sql(self, result_type=MULTI, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):
         """
@@ -1242,6 +1245,51 @@ class SQLCompiler:
             # unless the database doesn't support it.
             return list(result)
         return result
+
+    if IS_ASYNC:
+        async def execute_sql(self, result_type=MULTI, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):
+            """
+            Run the query against the database and return the result(s). The
+            return value is a single data item if result_type is SINGLE, or an
+            iterator over the results if the result_type is MULTI.
+
+            result_type is either MULTI (use fetchmany() to retrieve all rows),
+            SINGLE (only retrieve a single row), or None. In this last case, the
+            cursor is returned if any query is executed, since it's used by
+            subclasses such as InsertQuery). It's possible, however, that no query
+            is needed, as the filters describe an empty set. In that case, None is
+            returned, to avoid any unnecessary database interaction.
+            """
+            result_type = result_type or NO_RESULTS
+            sql, params = self.as_sql()
+            import psycopg
+
+            if chunked_fetch:
+                async def agen():
+                    async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
+                        async with aconn.cursor() as acur:
+                            await acur.execute(sql, params)
+                            while True:
+                                rows = await acur.fetchmany(size=chunk_size)
+                                if not rows:
+                                    break
+                                yield rows
+                return agen()
+
+            assert not chunked_fetch
+
+            async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
+                async with aconn.cursor() as acur:
+                    await acur.execute(sql, params)
+                    if result_type == SINGLE:
+                        val = await acur.fetchone()
+                        if val:
+                            return val[0:self.col_count]
+                        return val
+                    elif result_type == CURSOR:
+                        return RetCursor(acur.rowcount)
+                    rows = await acur.fetchmany()
+                    return [rows]
 
     def as_subquery_condition(self, alias, columns, compiler):
         qn = compiler.quote_name_unless_alias
@@ -1438,29 +1486,32 @@ class SQLInsertCompiler(SQLCompiler):
                 for p, vals in zip(placeholder_rows, param_rows)
             ]
 
-    def execute_sql(self, returning_fields=None):
+    async def execute_sql(self, returning_fields=None):
         assert not (
             returning_fields and len(self.query.objs) != 1 and
             not self.connection.features.can_return_rows_from_bulk_insert
         )
         opts = self.query.get_meta()
         self.returning_fields = returning_fields
-        with self.connection.cursor() as cursor:
-            for sql, params in self.as_sql():
-                cursor.execute(sql, params)
-            if not self.returning_fields:
-                return []
-            if self.connection.features.can_return_rows_from_bulk_insert and len(self.query.objs) > 1:
-                rows = self.connection.ops.fetch_returned_insert_rows(cursor)
-            elif self.connection.features.can_return_columns_from_insert:
-                assert len(self.query.objs) == 1
-                rows = [self.connection.ops.fetch_returned_insert_columns(
-                    cursor, self.returning_params,
-                )]
-            else:
-                rows = [(self.connection.ops.last_insert_id(
-                    cursor, opts.db_table, opts.pk.column,
-                ),)]
+        import psycopg
+        async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
+            async with aconn.cursor() as acur:
+        # with self.connection.cursor() as cursor:
+                for sql, params in self.as_sql():
+                    await acur.execute(sql, params)
+            assert not self.returning_fields
+            return []
+            # if self.connection.features.can_return_rows_from_bulk_insert and len(self.query.objs) > 1:
+            #     rows = self.connection.ops.fetch_returned_insert_rows(cursor)
+            # elif self.connection.features.can_return_columns_from_insert:
+            #     assert len(self.query.objs) == 1
+            #     rows = [self.connection.ops.fetch_returned_insert_columns(
+            #         cursor, self.returning_params,
+            #     )]
+            # else:
+            #     rows = [(self.connection.ops.last_insert_id(
+            #         cursor, opts.db_table, opts.pk.column,
+            #     ),)]
         cols = [field.get_col(opts.db_table) for field in self.returning_fields]
         converters = self.get_converters(cols)
         if converters:
@@ -1590,14 +1641,14 @@ class SQLUpdateCompiler(SQLCompiler):
             result.append('WHERE %s' % where)
         return ' '.join(result), tuple(update_params + params)
 
-    def execute_sql(self, result_type):
+    async def execute_sql(self, result_type):
         """
         Execute the specified update. Return the number of rows affected by
         the primary update query. The "primary update query" is the first
         non-empty query that is executed. Row counts for any subsequent,
         related queries are not available.
         """
-        cursor = super().execute_sql(result_type)
+        cursor = await super().execute_sql(result_type)
         try:
             rows = cursor.rowcount if cursor else 0
             is_empty = cursor is None
@@ -1605,7 +1656,7 @@ class SQLUpdateCompiler(SQLCompiler):
             if cursor:
                 cursor.close()
         for query in self.query.get_related_updates():
-            aux_rows = query.get_compiler(self.using).execute_sql(result_type)
+            aux_rows = await query.get_compiler(self.using).execute_sql(result_type)
             if is_empty and aux_rows:
                 rows = aux_rows
                 is_empty = False

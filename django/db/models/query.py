@@ -22,6 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
+from django.pwt import IS_ASYNC, use_driver
 from django.utils import timezone
 from django.utils.functional import cached_property, partition
 
@@ -44,49 +45,11 @@ class ModelIterable(BaseIterable):
 
     def __iter__(self):
         queryset = self.queryset
-        db = queryset.db
-        compiler = queryset.query.get_compiler(using=db)
-        # Execute the query. This will also fill compiler.select, klass_info,
-        # and annotations.
+        compiler = queryset.query.get_compiler(using=queryset.db)
         results = compiler.execute_sql(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)
-        select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,
-                                                  compiler.annotation_col_map)
-        model_cls = klass_info['model']
-        select_fields = klass_info['select_fields']
-        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
-        init_list = [f[0].target.attname
-                     for f in select[model_fields_start:model_fields_end]]
-        related_populators = get_related_populators(klass_info, select, db)
-        known_related_objects = [
-            (field, related_objs, operator.attrgetter(*[
-                field.attname
-                if from_field == 'self' else
-                queryset.model._meta.get_field(from_field).attname
-                for from_field in field.from_fields
-            ])) for field, related_objs in queryset._known_related_objects.items()
-        ]
-        for row in compiler.results_iter(results):
-            obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])
-            for rel_populator in related_populators:
-                rel_populator.populate(row, obj)
-            if annotation_col_map:
-                for attr_name, col_pos in annotation_col_map.items():
-                    setattr(obj, attr_name, row[col_pos])
+        rows = compiler.results_iter(results)
+        yield from queryset.make_objects(compiler, rows)
 
-            # Add the known related objects to the model.
-            for field, rel_objs, rel_getter in known_related_objects:
-                # Avoid overwriting objects loaded by, e.g., select_related().
-                if field.is_cached(obj):
-                    continue
-                rel_obj_id = rel_getter(obj)
-                try:
-                    rel_obj = rel_objs[rel_obj_id]
-                except KeyError:
-                    pass  # May happen in qs1 | qs2 scenarios.
-                else:
-                    setattr(obj, field.name, rel_obj)
-
-            yield obj
 
 
 class ValuesIterable(BaseIterable):
@@ -358,6 +321,55 @@ class QuerySet:
     def _iterator(self, use_chunked_fetch, chunk_size):
         yield from self._iterable_class(self, chunked_fetch=use_chunked_fetch, chunk_size=chunk_size)
 
+    if IS_ASYNC:
+        async def _iterator(self, use_chunked_fetch, chunk_size):
+            compiler = self.query.get_compiler(using=self.db)
+            aiter = await compiler.execute_sql(chunked_fetch=use_chunked_fetch, chunk_size=chunk_size)
+            async for rows in aiter:
+                yield list(self.make_objects(compiler, rows))
+
+    def make_objects(self, compiler, rows):
+        queryset = self
+        db = queryset.db
+        select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,
+                                                  compiler.annotation_col_map)
+        model_cls = klass_info['model']
+        select_fields = klass_info['select_fields']
+        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
+        init_list = [f[0].target.attname
+                     for f in select[model_fields_start:model_fields_end]]
+        related_populators = get_related_populators(klass_info, select, db)
+        known_related_objects = [
+            (field, related_objs, operator.attrgetter(*[
+                field.attname
+                if from_field == 'self' else
+                queryset.model._meta.get_field(from_field).attname
+                for from_field in field.from_fields
+            ])) for field, related_objs in queryset._known_related_objects.items()
+        ]
+        for row in rows:
+            obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])
+            for rel_populator in related_populators:
+                rel_populator.populate(row, obj)
+            if annotation_col_map:
+                for attr_name, col_pos in annotation_col_map.items():
+                    setattr(obj, attr_name, row[col_pos])
+
+            # Add the known related objects to the model.
+            for field, rel_objs, rel_getter in known_related_objects:
+                # Avoid overwriting objects loaded by, e.g., select_related().
+                if field.is_cached(obj):
+                    continue
+                rel_obj_id = rel_getter(obj)
+                try:
+                    rel_obj = rel_objs[rel_obj_id]
+                except KeyError:
+                    pass  # May happen in qs1 | qs2 scenarios.
+                else:
+                    setattr(obj, field.name, rel_obj)
+
+            yield obj
+
     def iterator(self, chunk_size=2000):
         """
         An iterator over the results from applying this QuerySet to the
@@ -417,7 +429,7 @@ class QuerySet:
 
         return self.query.get_count(using=self.db)
 
-    def get(self, *args, **kwargs):
+    def _get(self, *args, **kwargs):
         """
         Perform the query and return a single object matching the given
         keyword arguments.
@@ -434,6 +446,47 @@ class QuerySet:
         if not clone.query.select_for_update or connections[clone.db].features.supports_select_for_update_with_limit:
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
+        return clone
+
+    def _eval_result_cache(self):
+        if self._result_cache is None:
+            self._result_cache = list(self._iterable_class(self))
+        return self._result_cache
+
+    if IS_ASYNC:
+        async def _eval_result_cache(self):
+            if self._result_cache is not None:
+                return self._result_cache
+            compiler = self.query.get_compiler(using=self.db)
+            [rows] = await compiler.execute_sql()
+            self._result_cache = list(self.make_objects(compiler, rows))
+            return self._result_cache
+
+    #TODO fetch_all?
+    async def _await(self):
+        await self._eval_result_cache()
+        if self._prefetch_related_lookups and not self._prefetch_done:
+            await self._prefetch_related_objects()
+        return self
+
+    def __await__(self):
+        return self._await().__await__()
+
+    async def get(self, *args, **kwargs):
+        """
+        Perform the query and return a single object matching the given
+        keyword arguments.
+        """
+        qs = self._get(*args, **kwargs)
+        await qs
+        return qs.get_one()
+
+    def get_one(self):
+        """
+        Perform the query and return a single object matching the given
+        keyword arguments.
+        """
+        clone = self
         num = len(clone)
         if num == 1:
             return clone._result_cache[0]
@@ -442,6 +495,7 @@ class QuerySet:
                 "%s matching query does not exist." %
                 self.model._meta.object_name
             )
+        #FIXME
         raise self.model.MultipleObjectsReturned(
             'get() returned more than one %s -- it returned %s!' % (
                 self.model._meta.object_name,
@@ -797,7 +851,7 @@ class QuerySet:
         return rows
     update.alters_data = True
 
-    def _update(self, values):
+    async def _update(self, values):
         """
         A version of update() that accepts field objects instead of field names.
         Used primarily for model saving and not intended for use by general
@@ -811,13 +865,13 @@ class QuerySet:
         # Clear any annotations so that they won't be present in subqueries.
         query.annotations = {}
         self._result_cache = None
-        return query.get_compiler(self.db).execute_sql(CURSOR)
+        return await query.get_compiler(self.db).execute_sql(CURSOR)
     _update.alters_data = True
     _update.queryset_only = False
 
     def exists(self):
         if self._result_cache is None:
-            return self.query.has_results(using=self.db)
+            return (yield from self.query.has_results(using=self.db))
         return bool(self._result_cache)
 
     def contains(self, obj):
@@ -841,9 +895,10 @@ class QuerySet:
             return obj in self._result_cache
         return self.filter(pk=obj.pk).exists()
 
+    @use_driver
     def _prefetch_related_objects(self):
         # This method can only be called once the result cache has been filled.
-        prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
+        yield from prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
         self._prefetch_done = True
 
     def explain(self, *, format=None, **options):
@@ -1293,7 +1348,7 @@ class QuerySet:
     # PRIVATE METHODS #
     ###################
 
-    def _insert(self, objs, fields, returning_fields=None, raw=False, using=None, ignore_conflicts=False):
+    async def _insert(self, objs, fields, returning_fields=None, raw=False, using=None, ignore_conflicts=False):
         """
         Insert a new record for the given model. This provides an interface to
         the InsertQuery class and is how Model.save() is implemented.
@@ -1303,7 +1358,7 @@ class QuerySet:
             using = self.db
         query = sql.InsertQuery(self.model, ignore_conflicts=ignore_conflicts)
         query.insert_values(fields, objs, raw=raw)
-        return query.get_compiler(using=using).execute_sql(returning_fields)
+        return await query.get_compiler(using=using).execute_sql(returning_fields)
     _insert.alters_data = True
     _insert.queryset_only = False
 
@@ -1359,7 +1414,7 @@ class QuerySet:
         if self._result_cache is None:
             self._result_cache = list(self._iterable_class(self))
         if self._prefetch_related_lookups and not self._prefetch_done:
-            self._prefetch_related_objects()
+            return self._prefetch_related_objects()
 
     def _next_is_sticky(self):
         """
@@ -1765,7 +1820,7 @@ def prefetch_related_objects(model_instances, *related_lookups):
                 obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
 
             if obj_to_fetch:
-                obj_list, additional_lookups = prefetch_one_level(
+                obj_list, additional_lookups = yield from prefetch_one_level(
                     obj_to_fetch,
                     prefetcher,
                     lookup,
@@ -1907,6 +1962,7 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
         # for performance reasons.
         rel_qs._prefetch_related_lookups = ()
 
+    yield rel_qs._eval_result_cache, ()
     all_related_objects = list(rel_qs)
 
     rel_obj_cache = {}
