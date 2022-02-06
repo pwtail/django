@@ -1154,16 +1154,16 @@ class SQLCompiler:
                     converters[i] = (backend_converters + field_converters, expression)
         return converters
 
-    # def apply_converters(self, rows, converters):
-    #     connection = self.connection
-    #     converters = list(converters.items())
-    #     for row in map(list, rows):
-    #         for pos, (convs, expression) in converters:
-    #             value = row[pos]
-    #             for converter in convs:
-    #                 value = converter(value, expression, connection)
-    #             row[pos] = value
-    #         yield row
+    def apply_converters(self, rows, converters):
+        connection = self.connection
+        converters = list(converters.items())
+        for row in map(list, rows):
+            for pos, (convs, expression) in converters:
+                value = row[pos]
+                for converter in convs:
+                    value = converter(value, expression, connection)
+                row[pos] = value
+            yield row
 
     def apply_converters_(self, rows):
         fields = [s[0] for s in self.select[0:self.col_count]]

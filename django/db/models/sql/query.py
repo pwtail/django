@@ -35,6 +35,7 @@ from django.db.models.sql.datastructures import (
 from django.db.models.sql.where import (
     AND, OR, ExtraWhere, NothingNode, WhereNode,
 )
+from django.pwt import wait
 from django.utils.functional import cached_property
 from django.utils.tree import Node
 
@@ -422,7 +423,7 @@ class Query(BaseExpression):
         Return the dictionary with the values of the existing aggregations.
         """
         if not self.annotation_select:
-            return {}
+            return wait.value({})
         existing_annotations = [
             annotation for alias, annotation
             in self.annotations.items()
@@ -502,13 +503,17 @@ class Query(BaseExpression):
         outer_query.select_related = False
         compiler = outer_query.get_compiler(using, elide_empty=elide_empty)
         result = compiler.execute_sql(SINGLE)
-        if result is None:
-            result = empty_set_result
 
-        converters = compiler.get_converters(outer_query.annotation_select.values())
-        result = next(compiler.apply_converters((result,), converters))
+        @wait
+        def run(result=result):
+            if result is None:
+                result = empty_set_result
+            converters = compiler.get_converters(outer_query.annotation_select.values())
+            result = next(compiler.apply_converters((result,), converters))
 
-        return dict(zip(outer_query.annotation_select, result))
+            return dict(zip(outer_query.annotation_select, result))
+
+        return run()
 
     def get_count(self, using):
         """

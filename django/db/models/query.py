@@ -22,7 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
-from django.pwt import Branch, IS_ASYNC
+from django.pwt import is_async
 from django.utils import timezone
 from django.utils.deprecation import RemovedInDjango50Warning
 from django.utils.functional import cached_property, partition
@@ -906,18 +906,18 @@ class _QuerySet:
         # This method can only be called once the result cache has been filled.
         querysets = prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
 
-        if IS_ASYNC:
-            async def next():
+        if is_async():
+            async def then():
                 for qs in querysets:
                     await qs
                 self._prefetch_done = True
         else:
-            def next():
+            def then():
                 for qs in querysets:
                     list(qs)
                 self._prefetch_done = True
 
-        return next()
+        return then()
 
     def explain(self, *, format=None, **options):
         return self.query.explain(using=self.db, format=format, **options)

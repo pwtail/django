@@ -32,7 +32,18 @@ class QsMixin:
         return self._result_cache
 
     def __await__(self):
+        #TODO rename _fetch_all
         return self._fetch_all().__await__()
+
+    #TODO do not store the connection!
+    # get a testcase
+    # def iterate(self):
+    #     compiler = self.compiler
+    #     sql, params = compiler.as_sql()
+    #     with compiler.connection.cursor() as cursor:
+    #         cursor.execute(sql, params)
+    #         rows = cursor.fetchmany(size=1)
+    #         yield from self._make_objects(rows)
 
     def _make_objects(self, rows):
         from django.db.models.query import get_related_populators
