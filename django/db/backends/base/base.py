@@ -4,7 +4,9 @@ import threading
 import time
 import warnings
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
+
+from django.pwt import set_connection, get_connection, is_async
 
 try:
     import zoneinfo
@@ -56,10 +58,47 @@ class BaseDatabaseWrapper:
 
     queries_limit = 9000
 
+    @property
+    def connection(self):
+        return get_connection()
+
+    @connection.setter
+    def connection(self, connection):
+        set_connection(connection)
+
+    def cursor_decorator(self, fn):
+        async def awrapper(*args, **kwargs):
+            async with self.cursor() as cursor:
+                return await fn(*args, cursor=cursor, **kwargs)
+
+        def wrapper(*args, **kwargs):
+            if not is_async():
+                with self.cursor() as cursor:
+                    return fn(*args, cursor=cursor, **kwargs)
+            return awrapper(*args, **kwargs)
+
+        return wrapper
+
+    def cursor(self, fn=None):
+        if fn and callable(fn):
+            return self.cursor_decorator(fn)
+        if not is_async():
+            return self.get_cursor()
+
+        @asynccontextmanager
+        async def cursor():
+            if self.async_pool is None:
+                await self.start_pool()
+            async with self.async_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    yield cur
+
+        return cursor()
+
     def __init__(self, settings_dict, alias=DEFAULT_DB_ALIAS):
         # Connection related attributes.
         # The underlying database connection.
-        self.connection = None
+        # self.connection = None
         # `settings_dict` should be a dictionary containing keys such as
         # NAME, USER, etc. It's called `settings_dict` instead of `settings`
         # to disambiguate it from Django settings modules.
@@ -280,7 +319,7 @@ class BaseDatabaseWrapper:
     # ##### Generic wrappers for PEP-249 connection methods #####
 
     @async_unsafe
-    def cursor(self):
+    def get_cursor(self):
         """Create a cursor, opening a connection if necessary."""
         return self._cursor()
 

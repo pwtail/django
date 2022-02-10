@@ -31,6 +31,10 @@ class ConnectionDoesNotExist(Exception):
     pass
 
 
+class Obj:
+    pass
+
+
 class BaseConnectionHandler:
     settings_name = None
     exception_class = ConnectionDoesNotExist
@@ -38,7 +42,8 @@ class BaseConnectionHandler:
 
     def __init__(self, settings=None):
         self._settings = settings
-        self._connections = Local(self.thread_critical)
+        # self._connections = Local(self.thread_critical)
+        self._connections = Obj()
 
     @cached_property
     def settings(self):

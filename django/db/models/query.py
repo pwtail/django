@@ -22,7 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
-from django.pwt import is_async, wait
+from django.pwt import then, wait, gen, zeroctx
 from django.utils import timezone
 from django.utils.deprecation import RemovedInDjango50Warning
 from django.utils.functional import cached_property, partition
@@ -422,7 +422,7 @@ class _QuerySet:
 
         _ = clone._fetch_all()
 
-        @wait()
+        @wait
         def run(_=_):
             num = len(clone._result_cache)
             if num == 1:
@@ -516,6 +516,7 @@ class _QuerySet:
             return OnConflict.UPDATE
         return None
 
+    @gen
     def bulk_create(
         self, objs, batch_size=None, ignore_conflicts=False,
         update_conflicts=False, update_fields=None, unique_fields=None,
@@ -561,10 +562,11 @@ class _QuerySet:
         fields = opts.concrete_fields
         objs = list(objs)
         self._prepare_for_bulk_create(objs)
-        with transaction.atomic(using=self.db, savepoint=False):
+        # with transaction.atomic(using=self.db, savepoint=False):
+        with zeroctx():
             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
             if objs_with_pk:
-                returned_columns = self._batched_insert(
+                returned_columns = yield from self._batched_insert(
                     objs_with_pk,
                     fields,
                     batch_size,
@@ -581,7 +583,7 @@ class _QuerySet:
                     obj_with_pk._state.db = self.db
             if objs_without_pk:
                 fields = [f for f in fields if not isinstance(f, AutoField)]
-                returned_columns = self._batched_insert(
+                returned_columns = yield from self._batched_insert(
                     objs_without_pk,
                     fields,
                     batch_size,
@@ -865,8 +867,8 @@ class _QuerySet:
 
         @wait
         def run(cursor=cursor):
-            return cursor.rowcount
             self._result_cache = None
+            return cursor.rowcount
         return run()
     update.alters_data = True
 
@@ -884,14 +886,20 @@ class _QuerySet:
         # Clear any annotations so that they won't be present in subqueries.
         query.annotations = {}
         self._result_cache = None
-        return query.get_compiler(self.db).execute_sql(CURSOR)
+        cursor = query.get_compiler(self.db).execute_sql(CURSOR)
+
+        @then
+        def do(cursor=cursor):
+            return cursor.rowcount
+        return do()
     _update.alters_data = True
     _update.queryset_only = False
 
     def exists(self):
         if self._result_cache is None:
             return self.query.has_results(using=self.db)
-        return bool(self._result_cache)
+        ret = bool(self._result_cache)
+        return wait.value(ret)
 
     def contains(self, obj):
         """Return True if the queryset contains an object."""
@@ -917,18 +925,12 @@ class _QuerySet:
         # This method can only be called once the result cache has been filled.
         querysets = prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
 
-        if is_async():
-            async def then():
-                for qs in querysets:
-                    await qs
-                self._prefetch_done = True
-        else:
-            def then():
-                for qs in querysets:
-                    list(qs)
-                self._prefetch_done = True
+        @then
+        def run(_=querysets):
+            #TODO move to _fetch_all
+            self._prefetch_done = True
 
-        return then()
+        return run()
 
     def explain(self, *, format=None, **options):
         return self.query.explain(using=self.db, format=format, **options)
@@ -1414,12 +1416,13 @@ class _QuerySet:
         bulk_return = connection.features.can_return_rows_from_bulk_insert
         for item in [objs[i:i + batch_size] for i in range(0, len(objs), batch_size)]:
             if bulk_return and on_conflict is None:
-                inserted_rows.extend(self._insert(
+                rows = yield self._insert(
                     item, fields=fields, using=self.db,
                     returning_fields=self.model._meta.db_returning_fields,
-                ))
+                )
+                inserted_rows.extend(rows)
             else:
-                self._insert(
+                yield self._insert(
                     item,
                     fields=fields,
                     using=self.db,
@@ -1781,7 +1784,7 @@ def normalize_prefetch_lookups(lookups, prefix=None):
         ret.append(lookup)
     return ret
 
-
+@gen
 def prefetch_related_objects(model_instances, *related_lookups):
     """
     Populate prefetched object caches for a list of model instances based on

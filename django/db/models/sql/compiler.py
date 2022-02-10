@@ -5,7 +5,7 @@ from functools import partial
 from itertools import chain
 
 from django.core.exceptions import EmptyResultSet, FieldError
-from django.db import DatabaseError, NotSupportedError
+from django.db import DatabaseError, NotSupportedError, connection
 from django.db.models.constants import LOOKUP_SEP
 from django.db.models.expressions import F, OrderBy, RawSQL, Ref, Value
 from django.db.models.functions import Cast, Random
@@ -15,7 +15,7 @@ from django.db.models.sql.constants import (
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
-from django.pwt import Branch, RetCursor, wait
+from django.pwt import Branch, RetCursor, then, later, gen
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
@@ -1202,7 +1202,7 @@ class SQLCompiler:
         """
         result = self.execute_sql(SINGLE)
 
-        @wait
+        @then
         def ret(result=result):
             return bool(result)
         return ret()
@@ -1210,7 +1210,7 @@ class SQLCompiler:
     branch = Branch()
 
     @branch
-    def execute_sql(self, result_type=MULTI):
+    def execute_sql(self, result_type=MULTI, sql_and_params=None):
         """
         Run the query against the database and return the result(s). The
         return value is a single data item if result_type is SINGLE, or an
@@ -1225,7 +1225,10 @@ class SQLCompiler:
         """
         result_type = result_type or NO_RESULTS
         try:
-            sql, params = self.as_sql()
+            if sql_and_params:
+                sql, params = sql_and_params
+            else:
+                sql, params = self.as_sql()
             if not sql:
                 raise EmptyResultSet
         except EmptyResultSet:
@@ -1260,8 +1263,30 @@ class SQLCompiler:
         rows = cursor.fetchall()
         return rows
 
-    @branch
-    async def execute_sql(self, result_type=MULTI):
+    # @branch
+    # async def execute_sql(self, result_type=MULTI, sql_and_params=None):
+    #     result_type = result_type or NO_RESULTS
+    #     if sql_and_params:
+    #         sql, params = sql_and_params
+    #     else:
+    #         sql, params = self.as_sql()
+    #     import psycopg
+    #
+    #     async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
+    #         async with aconn.cursor() as acur:
+    #             await acur.execute(sql, params)
+    #             if result_type == SINGLE:
+    #                 val = await acur.fetchone()
+    #                 if val:
+    #                     return val[0:self.col_count]
+    #                 return val
+    #             elif result_type == CURSOR:
+    #                 return RetCursor(acur.rowcount)
+    #             rows = await acur.fetchall()
+    #             return rows
+
+    @connection.cursor
+    def execute_sql(self, result_type=MULTI, cursor=None):
         """
         Run the query against the database and return the result(s). The
         return value is a single data item if result_type is SINGLE, or an
@@ -1275,21 +1300,36 @@ class SQLCompiler:
         returned, to avoid any unnecessary database interaction.
         """
         result_type = result_type or NO_RESULTS
-        sql, params = self.as_sql()
-        import psycopg
+        try:
+            sql, params = self.as_sql()
+            if not sql:
+                raise EmptyResultSet
+        except EmptyResultSet:
+            if result_type == MULTI:
+                return iter([])
+            else:
+                return
+        execute = cursor.execute(sql, params)
+        fetchone = fetchall = None
+        if result_type == SINGLE:
+            fetchone = cursor.fetchone()
+        elif result_type == MULTI:
+            fetchall = cursor.fetchall()
 
-        async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
-            async with aconn.cursor() as acur:
-                await acur.execute(sql, params)
-                if result_type == SINGLE:
-                    val = await acur.fetchone()
-                    if val:
-                        return val[0:self.col_count]
-                    return val
-                elif result_type == CURSOR:
-                    return RetCursor(acur.rowcount)
-                rows = await acur.fetchall()
+        @later
+        def execute_sql(_=execute, val=fetchone, rows=fetchall):
+            if result_type == SINGLE:
+                if val:
+                    return val[0:self.col_count]
+                return val
+            elif result_type == MULTI:
                 return rows
+            elif result_type == NO_RESULTS:
+                return None
+            elif result_type == CURSOR:
+                return RetCursor(cursor.rowcount)
+
+        return execute_sql()
 
     def as_subquery_condition(self, alias, columns, compiler):
         qn = compiler.quote_name_unless_alias
@@ -1491,29 +1531,38 @@ class SQLInsertCompiler(SQLCompiler):
                 for p, vals in zip(placeholder_rows, param_rows)
             ]
 
-    def execute_sql(self, returning_fields=None):
+    @connection.cursor
+    @gen
+    def execute_sql(self, returning_fields=None, cursor=None):
         assert not (
             returning_fields and len(self.query.objs) != 1 and
             not self.connection.features.can_return_rows_from_bulk_insert
         )
         opts = self.query.get_meta()
         self.returning_fields = returning_fields
-        with self.connection.cursor() as cursor:
-            for sql, params in self.as_sql():
-                cursor.execute(sql, params)
-            if not self.returning_fields:
-                return []
-            if self.connection.features.can_return_rows_from_bulk_insert and len(self.query.objs) > 1:
-                rows = self.connection.ops.fetch_returned_insert_rows(cursor)
-            elif self.connection.features.can_return_columns_from_insert:
-                assert len(self.query.objs) == 1
-                rows = [self.connection.ops.fetch_returned_insert_columns(
-                    cursor, self.returning_params,
-                )]
-            else:
-                rows = [(self.connection.ops.last_insert_id(
-                    cursor, opts.db_table, opts.pk.column,
-                ),)]
+        # with self.connection.cursor() as cursor:
+
+
+        for sql, params in self.as_sql():
+            yield cursor.execute(sql, params)
+
+        if not self.returning_fields:
+            return []
+
+        if self.connection.features.can_return_rows_from_bulk_insert and len(self.query.objs) > 1:
+            rows = yield self.connection.ops.fetch_returned_insert_rows(cursor)
+        elif self.connection.features.can_return_columns_from_insert:
+            assert len(self.query.objs) == 1
+            row = yield self.connection.ops.fetch_returned_insert_columns(
+                cursor, self.returning_params,
+            )
+            rows = [row]
+        else:
+            id = yield self.connection.ops.last_insert_id(
+                cursor, opts.db_table, opts.pk.column,
+            )
+            rows = [(id,)]
+
         cols = [field.get_col(opts.db_table) for field in self.returning_fields]
         converters = self.get_converters(cols)
         if converters:
