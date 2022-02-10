@@ -115,43 +115,14 @@ def zeroctx():
 
 
 
-# def use_cursor(fn):
-#     async def awrapper(*args, **kwargs):
-#         async with cursor():
-#             return await fn(*args, cursor=cursor, **kwargs)
-#
-#     def wrapper(*args, **kwargs):
-#         if not is_async():
-#             with cursor():
-#                 return fn(*args, cursor=cursor, **kwargs)
-#         return awrapper(*args, **kwargs)
-#
-#     return wrapper
-
-
 
 threadlocal = threading.local()
+
 
 def set_connection(connection):
     threadlocal.connection = connection
 
+
 #TODO using
 def get_connection():
     return getattr(threadlocal, 'connection', None)
-
-# async def te():
-#     po = await connection.start_pool()
-#     async with po.connection() as conn:
-#         # async with conn.transaction():
-#         async with conn.cursor() as cur:
-#             await cur.execute('select 1')
-#             v = await cur.fetchall()
-#         print(v)
-#
-# async def te2():
-#     import psycopg
-#     async with await psycopg.AsyncConnection.connect("dbname=smog user=postgres password=postgre") as aconn:
-#         async with aconn.cursor() as cur:
-#             await cur.execute('select 1')
-#             v = await cur.fetchall()
-#     print(v)
