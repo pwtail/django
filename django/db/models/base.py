@@ -893,7 +893,6 @@ class Model(metaclass=ModelBase):
             if update_fields and not updated:
                 raise DatabaseError("Save with update_fields did not affect any rows.")
         if not updated:
-            assert False
             if meta.order_with_respect_to:
                 # If this is a model with an order_with_respect_to
                 # autopopulate the _order field
@@ -910,7 +909,8 @@ class Model(metaclass=ModelBase):
                 fields = [f for f in fields if f is not meta.auto_field]
 
             returning_fields = meta.db_returning_fields
-            results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+            results = yield self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+
             if results:
                 for value, field in zip(results[0], returning_fields):
                     setattr(self, field.attname, value)
