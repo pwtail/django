@@ -6,7 +6,7 @@ import warnings
 from collections import deque
 from contextlib import contextmanager, asynccontextmanager
 
-from django.pwt import set_connection, get_connection, is_async
+from django.pwt import is_async, async_connection
 
 try:
     import zoneinfo
@@ -58,13 +58,6 @@ class BaseDatabaseWrapper:
 
     queries_limit = 9000
 
-    @property
-    def connection(self):
-        return get_connection()
-
-    @connection.setter
-    def connection(self, connection):
-        set_connection(connection)
 
     def cursor_decorator(self, fn):
         async def awrapper(*args, **kwargs):
@@ -80,15 +73,21 @@ class BaseDatabaseWrapper:
         return wrapper
 
     def cursor(self, fn=None):
-        if fn and callable(fn):
+        if callable(fn):
             return self.cursor_decorator(fn)
         if not is_async():
             return self.get_cursor()
+
+        #TODO give a warning if connection is active and asking for connection
 
         @asynccontextmanager
         async def cursor():
             if self.async_pool is None:
                 await self.start_pool()
+            if (conn := async_connection.get()) is not None:
+                async with conn.cursor() as cur:
+                    yield cur
+                return
             async with self.async_pool.connection() as conn:
                 async with conn.cursor() as cur:
                     yield cur

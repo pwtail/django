@@ -11,7 +11,7 @@ class QsMixin:
     def compiler(self):
         return self.query.get_compiler(using=self.db)
 
-    branch = Branch()
+    branch = Branch.Descriptor()
 
     @branch
     async def _fetch_all(self):

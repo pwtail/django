@@ -1,42 +1,16 @@
 
 import inspect
 
-#TODO threadlocal
-import threading
 import typing
-from contextlib import contextmanager, asynccontextmanager
+from contextlib import contextmanager
+from contextvars import ContextVar
 
-from django.db import connection
 
+# TODO move to connection
 IS_ASYNC = True
 
 def is_async():
     return IS_ASYNC
-
-
-class Branch:
-    def __init__(self):
-        self.ns = {}
-
-    def __set_name__(self, owner, name):
-        self.name = name
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        type = 'async' if is_async() else 'sync'
-        func = self.ns[type, self.name]
-        return func.__get__(instance)
-
-    def __call__(self, func):
-        name = func.__name__
-        if inspect.iscoroutinefunction(func):
-            type = 'async'
-        else:
-            type = 'sync'
-        self.ns[type, name] = func
-        return self
-
 
 
 class RetCursor(typing.NamedTuple):
@@ -116,13 +90,85 @@ def zeroctx():
 
 
 
-threadlocal = threading.local()
+# threadlocal = threading.local()
+#
+#
+# def set_connection(connection):
+#     threadlocal.connection = connection
+#
+#
+# #TODO using
+# def get_connection():
+#     return getattr(threadlocal, 'connection', None)
 
 
-def set_connection(connection):
-    threadlocal.connection = connection
+function = type(lambda: None)
 
 
-#TODO using
-def get_connection():
-    return getattr(threadlocal, 'connection', None)
+class AbstractBranchWrapper:
+    def __init__(self, type=None):
+        self.wrappers = {}
+        self.type = type
+
+    def make_wrapper(self):
+        raise NotImplementedError
+
+    def __call__(self, fn=None, type=None, name=None):
+        if type and not fn:
+            return lambda func: self(func, type=type, name=name)
+        if not type:
+            if inspect.iscoroutinefunction(fn):
+                type = 'async'
+            else:
+                type = 'sync'
+        if not name:
+            name = fn.__name__
+        if name not in self.wrappers:
+            wrapper = self.wrappers[name] = self.make_wrapper()
+        else:
+            wrapper = self.wrappers[name]
+        if not hasattr(wrapper, 'options'):
+            wrapper.options = [None, None]
+        if type == 'sync':
+            wrapper.options[0] = fn
+        else:
+            wrapper.options[1] = fn
+        return wrapper
+
+
+class BranchDescriptor(AbstractBranchWrapper):
+
+    class Descriptor:
+        options: list  # [sync_fn, async_fn]
+
+        def __get__(self, instance, owner):
+            if instance is None:
+                return self
+            func = self.options[is_async()]
+            return func.__get__(instance)
+
+    make_wrapper = Descriptor
+
+
+class BranchWrapper(AbstractBranchWrapper):
+
+    @staticmethod
+    def make_wrapper():
+        def wrapper(*args, **kw):
+            options = wrapper.options
+            if not is_async():
+                sync_fn = options[0]
+                assert inspect.isfunction(sync_fn) and not inspect.iscoroutinefunction(sync_fn)
+                return sync_fn(*args, **kw)
+            async_fn = options[1]
+            return async_fn(*args, **kw)
+
+        return wrapper
+
+
+class Branch:
+    Wrapper = BranchWrapper
+    Descriptor = BranchDescriptor
+
+
+async_connection = ContextVar('async_connection', default=None)

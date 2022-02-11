@@ -11,11 +11,11 @@ from django.db.models.expressions import F, OrderBy, RawSQL, Ref, Value
 from django.db.models.functions import Cast, Random
 from django.db.models.query_utils import select_related_descend
 from django.db.models.sql.constants import (
-    CURSOR, GET_ITERATOR_CHUNK_SIZE, MULTI, NO_RESULTS, ORDER_DIR, SINGLE,
+    CURSOR, MULTI, NO_RESULTS, ORDER_DIR, SINGLE,
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
-from django.pwt import Branch, RetCursor, then, later, gen
+from django.pwt import RetCursor, then, later, gen
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
