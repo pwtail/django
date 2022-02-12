@@ -1,16 +1,14 @@
 
 import inspect
+import threading
 
 import typing
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 
-# TODO move to connection
-IS_ASYNC = True
-
 def is_async():
-    return IS_ASYNC
+    return threadlocal.IS_ASYNC
 
 
 class RetCursor(typing.NamedTuple):
@@ -83,6 +81,7 @@ def gen(fn):
     return wrapper
 
 
+#FIXME remove
 @contextmanager
 def zeroctx():
     yield
@@ -90,16 +89,8 @@ def zeroctx():
 
 
 
-# threadlocal = threading.local()
-#
-#
-# def set_connection(connection):
-#     threadlocal.connection = connection
-#
-#
-# #TODO using
-# def get_connection():
-#     return getattr(threadlocal, 'connection', None)
+threadlocal = threading.local()
+threadlocal.IS_ASYNC = True  # default
 
 
 function = type(lambda: None)
@@ -170,5 +161,3 @@ class Branch:
     Wrapper = BranchWrapper
     Descriptor = BranchDescriptor
 
-
-async_connection = ContextVar('async_connection', default=None)

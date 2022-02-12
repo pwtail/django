@@ -5,8 +5,9 @@ import time
 import warnings
 from collections import deque
 from contextlib import contextmanager, asynccontextmanager
+from contextvars import ContextVar
 
-from django.pwt import is_async, async_connection
+from django.pwt import is_async
 
 try:
     import zoneinfo
@@ -84,7 +85,7 @@ class BaseDatabaseWrapper:
         async def cursor():
             if self.async_pool is None:
                 await self.start_pool()
-            if (conn := async_connection.get()) is not None:
+            if (conn := self.async_connection.get()) is not None:
                 async with conn.cursor() as cur:
                     yield cur
                 return
@@ -159,6 +160,8 @@ class BaseDatabaseWrapper:
         self.introspection = self.introspection_class(self)
         self.ops = self.ops_class(self)
         self.validation = self.validation_class(self)
+
+        self.async_connection = ContextVar('async_connection', default=None)
 
     def __repr__(self):
         return (
