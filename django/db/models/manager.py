@@ -80,11 +80,12 @@ class BaseManager:
 
     @classmethod
     def _get_queryset_methods(cls, queryset_class):
-        def create_method(name, method):
+        def create_method(name, method=None):
             def manager_method(self, *args, **kwargs):
                 return getattr(self.get_queryset(), name)(*args, **kwargs)
-            manager_method.__name__ = method.__name__
-            manager_method.__doc__ = method.__doc__
+            if method:
+                manager_method.__name__ = method.__name__
+                manager_method.__doc__ = method.__doc__
             return manager_method
 
         new_methods = {}
@@ -98,6 +99,8 @@ class BaseManager:
                 continue
             # Copy the method onto the manager.
             new_methods[name] = create_method(name, method)
+        for name in ('bulk_create', 'bulk_update', 'delete'):
+            new_methods[name] = create_method(name)
         return new_methods
 
     @classmethod

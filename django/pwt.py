@@ -1,4 +1,4 @@
-
+import asyncio
 import inspect
 import threading
 
@@ -9,6 +9,9 @@ from contextvars import ContextVar
 
 def is_async():
     return threadlocal.IS_ASYNC
+
+def set_async(value):
+    threadlocal.IS_ASYNC = bool(value)
 
 
 class RetCursor(typing.NamedTuple):
@@ -57,6 +60,12 @@ wait.value = value
 del value
 
 
+def gather(*tasks):
+    if not is_async():
+        return tasks
+    return asyncio.gather(*tasks)
+
+
 def gen(fn):
     async def awrapper(*args, **kw):
         g = fn(*args, **kw)
@@ -79,14 +88,6 @@ def gen(fn):
                 return ex.value
 
     return wrapper
-
-
-#FIXME remove
-@contextmanager
-def zeroctx():
-    yield
-
-
 
 
 threadlocal = threading.local()

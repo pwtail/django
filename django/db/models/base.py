@@ -33,7 +33,7 @@ from django.db.models.signals import (
     class_prepared, post_init, post_save, pre_init, pre_save,
 )
 from django.db.models.utils import make_model_tuple
-from django.pwt import gen, is_async, zeroctx
+from django.pwt import gen, is_async
 from django.utils.encoding import force_str
 from django.utils.hashable import make_hashable
 from django.utils.text import capfirst, get_text_list
@@ -769,8 +769,9 @@ class Model(metaclass=ModelBase):
             if loaded_fields:
                 update_fields = frozenset(loaded_fields)
 
-        return self.save_base(using=using, force_insert=force_insert,
-                       force_update=force_update, update_fields=update_fields)
+        save_base = transaction.atomic(using=using, savepoint=False)(self.save_base)
+        return save_base(using=using, force_insert=force_insert,
+                         force_update=force_update, update_fields=update_fields)
     save.alters_data = True
 
     @gen
@@ -785,7 +786,6 @@ class Model(metaclass=ModelBase):
         models and not to do any changes to the values before save. This
         is used by fixture loading.
         """
-        using = using or router.db_for_write(self.__class__, instance=self)
         assert not (force_insert and (force_update or update_fields))
         assert update_fields is None or update_fields
         cls = origin = self.__class__
@@ -793,32 +793,18 @@ class Model(metaclass=ModelBase):
         if cls._meta.proxy:
             cls = cls._meta.concrete_model
         meta = cls._meta
-        # A transaction isn't needed if one query is issued.
-        if meta.parents:
-            context_manager = transaction.atomic(using=using, savepoint=False)
-        else:
-            context_manager = transaction.mark_for_rollback_on_error(using=using)
-        if not is_async():
-            context_manager = zeroctx()
-        with context_manager:
-            parent_inserted = False
-            if not raw:
-                parent_inserted = yield from self._save_parents(cls, using, update_fields)
-            updated = yield from self._save_table(
-                raw, cls, force_insert or parent_inserted,
-                force_update, using, update_fields,
-            )
+
+        parent_inserted = False
+        if not raw:
+            parent_inserted = yield from self._save_parents(cls, using, update_fields)
+        updated = yield from self._save_table(
+            raw, cls, force_insert or parent_inserted,
+            force_update, using, update_fields,
+        )
         # Store the database on which the object was saved
         self._state.db = using
         # Once saved, this is no longer a to-be-added instance.
         self._state.adding = False
-
-        # Signal that the save is complete
-        if not meta.auto_created:
-            post_save.send(
-                sender=origin, instance=self, created=(not updated),
-                update_fields=update_fields, raw=raw, using=using,
-            )
 
     save_base.alters_data = True
 

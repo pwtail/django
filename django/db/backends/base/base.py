@@ -161,6 +161,7 @@ class BaseDatabaseWrapper:
         self.ops = self.ops_class(self)
         self.validation = self.validation_class(self)
 
+        self.connection = None
         self.async_connection = ContextVar('async_connection', default=None)
 
     def __repr__(self):
