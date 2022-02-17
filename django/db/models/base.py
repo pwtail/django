@@ -33,6 +33,7 @@ from django.db.models.signals import (
     class_prepared, post_init, post_save, pre_init, pre_save,
 )
 from django.db.models.utils import make_model_tuple
+from django.pwt import gen, is_async
 from django.utils.encoding import force_str
 from django.utils.hashable import make_hashable
 from django.utils.text import capfirst, get_text_list
@@ -768,10 +769,12 @@ class Model(metaclass=ModelBase):
             if loaded_fields:
                 update_fields = frozenset(loaded_fields)
 
-        self.save_base(using=using, force_insert=force_insert,
-                       force_update=force_update, update_fields=update_fields)
+        save_base = transaction.atomic(using=using, savepoint=False)(self.save_base)
+        return save_base(using=using, force_insert=force_insert,
+                         force_update=force_update, update_fields=update_fields)
     save.alters_data = True
 
+    @gen
     def save_base(self, raw=False, force_insert=False,
                   force_update=False, using=None, update_fields=None):
         """
@@ -783,7 +786,6 @@ class Model(metaclass=ModelBase):
         models and not to do any changes to the values before save. This
         is used by fixture loading.
         """
-        using = using or router.db_for_write(self.__class__, instance=self)
         assert not (force_insert and (force_update or update_fields))
         assert update_fields is None or update_fields
         cls = origin = self.__class__
@@ -791,35 +793,18 @@ class Model(metaclass=ModelBase):
         if cls._meta.proxy:
             cls = cls._meta.concrete_model
         meta = cls._meta
-        if not meta.auto_created:
-            pre_save.send(
-                sender=origin, instance=self, raw=raw, using=using,
-                update_fields=update_fields,
-            )
-        # A transaction isn't needed if one query is issued.
-        if meta.parents:
-            context_manager = transaction.atomic(using=using, savepoint=False)
-        else:
-            context_manager = transaction.mark_for_rollback_on_error(using=using)
-        with context_manager:
-            parent_inserted = False
-            if not raw:
-                parent_inserted = self._save_parents(cls, using, update_fields)
-            updated = self._save_table(
-                raw, cls, force_insert or parent_inserted,
-                force_update, using, update_fields,
-            )
+
+        parent_inserted = False
+        if not raw:
+            parent_inserted = yield from self._save_parents(cls, using, update_fields)
+        updated = yield from self._save_table(
+            raw, cls, force_insert or parent_inserted,
+            force_update, using, update_fields,
+        )
         # Store the database on which the object was saved
         self._state.db = using
         # Once saved, this is no longer a to-be-added instance.
         self._state.adding = False
-
-        # Signal that the save is complete
-        if not meta.auto_created:
-            post_save.send(
-                sender=origin, instance=self, created=(not updated),
-                update_fields=update_fields, raw=raw, using=using,
-            )
 
     save_base.alters_data = True
 
@@ -832,8 +817,8 @@ class Model(metaclass=ModelBase):
             if (field and getattr(self, parent._meta.pk.attname) is None and
                     getattr(self, field.attname) is not None):
                 setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
-            parent_inserted = self._save_parents(cls=parent, using=using, update_fields=update_fields)
-            updated = self._save_table(
+            parent_inserted = yield from self._save_parents(cls=parent, using=using, update_fields=update_fields)
+            updated = yield from self._save_table(
                 cls=parent, using=using, update_fields=update_fields,
                 force_insert=parent_inserted,
             )
@@ -887,8 +872,8 @@ class Model(metaclass=ModelBase):
             values = [(f, None, (getattr(self, f.attname) if raw else f.pre_save(self, False)))
                       for f in non_pks]
             forced_update = update_fields or force_update
-            updated = self._do_update(base_qs, using, pk_val, values, update_fields,
-                                      forced_update)
+            updated = yield from self._do_update(base_qs, using, pk_val, values, update_fields,
+                                                 forced_update)
             if force_update and not updated:
                 raise DatabaseError("Forced update did not affect any rows.")
             if update_fields and not updated:
@@ -910,7 +895,8 @@ class Model(metaclass=ModelBase):
                 fields = [f for f in fields if f is not meta.auto_field]
 
             returning_fields = meta.db_returning_fields
-            results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+            results = yield self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+
             if results:
                 for value, field in zip(results[0], returning_fields):
                     setattr(self, field.attname, value)
@@ -928,10 +914,10 @@ class Model(metaclass=ModelBase):
             # case we just say the update succeeded. Another case ending up here
             # is a model with just PK - in that case check that the PK still
             # exists.
-            return update_fields is not None or filtered.exists()
+            return update_fields is not None or (yield filtered.exists())
         if self._meta.select_on_save and not forced_update:
             return (
-                filtered.exists() and
+                (yield filtered.exists()) and
                 # It may happen that the object is deleted from the DB right after
                 # this check, causing the subsequent UPDATE to return zero matching
                 # rows. The same result can occur in some rare cases when the
@@ -939,9 +925,11 @@ class Model(metaclass=ModelBase):
                 # successfully (a row is matched and updated). In order to
                 # distinguish these two cases, the object's existence in the
                 # database is again checked for if the UPDATE query returns 0.
-                (filtered._update(values) > 0 or filtered.exists())
+                (
+                    (yield filtered._update(values) > 0) or (yield filtered.exists())
+                )
             )
-        return filtered._update(values) > 0
+        return (yield filtered._update(values)) > 0
 
     def _do_insert(self, manager, using, fields, returning_fields, raw):
         """

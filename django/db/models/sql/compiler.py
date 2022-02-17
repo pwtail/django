@@ -5,16 +5,17 @@ from functools import partial
 from itertools import chain
 
 from django.core.exceptions import EmptyResultSet, FieldError
-from django.db import DatabaseError, NotSupportedError
+from django.db import DatabaseError, NotSupportedError, connection
 from django.db.models.constants import LOOKUP_SEP
 from django.db.models.expressions import F, OrderBy, RawSQL, Ref, Value
 from django.db.models.functions import Cast, Random
 from django.db.models.query_utils import select_related_descend
 from django.db.models.sql.constants import (
-    CURSOR, GET_ITERATOR_CHUNK_SIZE, MULTI, NO_RESULTS, ORDER_DIR, SINGLE,
+    CURSOR, MULTI, NO_RESULTS, ORDER_DIR, SINGLE,
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
+from django.pwt import RetCursor, then, later, gen
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
 from django.utils.regex_helper import _lazy_re_compile
@@ -1164,28 +1165,50 @@ class SQLCompiler:
                 row[pos] = value
             yield row
 
-    def results_iter(self, results=None, tuple_expected=False, chunked_fetch=False,
-                     chunk_size=GET_ITERATOR_CHUNK_SIZE):
-        """Return an iterator over the results from executing this query."""
-        if results is None:
-            results = self.execute_sql(MULTI, chunked_fetch=chunked_fetch, chunk_size=chunk_size)
+    def apply_converters_(self, rows):
         fields = [s[0] for s in self.select[0:self.col_count]]
         converters = self.get_converters(fields)
-        rows = chain.from_iterable(results)
-        if converters:
-            rows = self.apply_converters(rows, converters)
-            if tuple_expected:
-                rows = map(tuple, rows)
+        if not converters:
+            return rows
+        connection = self.connection
+        converters = list(converters.items())
+        rows = [list(row) for row in rows]
+        for row in rows:
+            for pos, (convs, expression) in converters:
+                value = row[pos]
+                for converter in convs:
+                    value = converter(value, expression, connection)
+                row[pos] = value
         return rows
+
+    # def results_iter(self, results=None, tuple_expected=False, chunked_fetch=False,
+    #                  chunk_size=GET_ITERATOR_CHUNK_SIZE):
+    #     """Return an iterator over the results from executing this query."""
+    #     if results is None:
+    #         results = self.execute_sql(MULTI, chunked_fetch=chunked_fetch, chunk_size=chunk_size)
+    #     fields = [s[0] for s in self.select[0:self.col_count]]
+    #     converters = self.get_converters(fields)
+    #     rows = chain.from_iterable(results)
+    #     if converters:
+    #         rows = self.apply_converters(rows, converters)
+    #         if tuple_expected:
+    #             rows = map(tuple, rows)
+    #     return rows
 
     def has_results(self):
         """
         Backends (e.g. NoSQL) can override this in order to use optimized
         versions of "query has any results."
         """
-        return bool(self.execute_sql(SINGLE))
+        result = self.execute_sql(SINGLE)
 
-    def execute_sql(self, result_type=MULTI, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):
+        @then
+        def ret(result=result):
+            return bool(result)
+        return ret()
+
+    @connection.cursor
+    def execute_sql(self, result_type=MULTI, cursor=None):
         """
         Run the query against the database and return the result(s). The
         return value is a single data item if result_type is SINGLE, or an
@@ -1208,45 +1231,27 @@ class SQLCompiler:
                 return iter([])
             else:
                 return
-        if chunked_fetch:
-            cursor = self.connection.chunked_cursor()
-        else:
-            cursor = self.connection.cursor()
-        try:
-            cursor.execute(sql, params)
-        except Exception:
-            # Might fail for server-side cursors (e.g. connection closed)
-            cursor.close()
-            raise
-
-        if result_type == CURSOR:
-            # Give the caller the cursor to process and close.
-            return cursor
+        execute = cursor.execute(sql, params)
+        fetchone = fetchall = None
         if result_type == SINGLE:
-            try:
-                val = cursor.fetchone()
+            fetchone = cursor.fetchone()
+        elif result_type == MULTI:
+            fetchall = cursor.fetchall()
+
+        @later
+        def execute_sql(_=execute, val=fetchone, rows=fetchall):
+            if result_type == SINGLE:
                 if val:
                     return val[0:self.col_count]
                 return val
-            finally:
-                # done with the cursor
-                cursor.close()
-        if result_type == NO_RESULTS:
-            cursor.close()
-            return
+            elif result_type == MULTI:
+                return rows
+            elif result_type == NO_RESULTS:
+                return None
+            elif result_type == CURSOR:
+                return RetCursor(cursor.rowcount)
 
-        result = cursor_iter(
-            cursor, self.connection.features.empty_fetchmany_value,
-            self.col_count if self.has_extra_select else None,
-            chunk_size,
-        )
-        if not chunked_fetch or not self.connection.features.can_use_chunked_reads:
-            # If we are using non-chunked reads, we return the same data
-            # structure as normally, but ensure it is all read into memory
-            # before going any further. Use chunked_fetch if requested,
-            # unless the database doesn't support it.
-            return list(result)
-        return result
+        return execute_sql()
 
     def as_subquery_condition(self, alias, columns, compiler):
         qn = compiler.quote_name_unless_alias
@@ -1448,29 +1453,38 @@ class SQLInsertCompiler(SQLCompiler):
                 for p, vals in zip(placeholder_rows, param_rows)
             ]
 
-    def execute_sql(self, returning_fields=None):
+    @connection.cursor
+    @gen
+    def execute_sql(self, returning_fields=None, cursor=None):
         assert not (
             returning_fields and len(self.query.objs) != 1 and
             not self.connection.features.can_return_rows_from_bulk_insert
         )
         opts = self.query.get_meta()
         self.returning_fields = returning_fields
-        with self.connection.cursor() as cursor:
-            for sql, params in self.as_sql():
-                cursor.execute(sql, params)
-            if not self.returning_fields:
-                return []
-            if self.connection.features.can_return_rows_from_bulk_insert and len(self.query.objs) > 1:
-                rows = self.connection.ops.fetch_returned_insert_rows(cursor)
-            elif self.connection.features.can_return_columns_from_insert:
-                assert len(self.query.objs) == 1
-                rows = [self.connection.ops.fetch_returned_insert_columns(
-                    cursor, self.returning_params,
-                )]
-            else:
-                rows = [(self.connection.ops.last_insert_id(
-                    cursor, opts.db_table, opts.pk.column,
-                ),)]
+        # with self.connection.cursor() as cursor:
+
+
+        for sql, params in self.as_sql():
+            yield cursor.execute(sql, params)
+
+        if not self.returning_fields:
+            return []
+
+        if self.connection.features.can_return_rows_from_bulk_insert and len(self.query.objs) > 1:
+            rows = yield self.connection.ops.fetch_returned_insert_rows(cursor)
+        elif self.connection.features.can_return_columns_from_insert:
+            assert len(self.query.objs) == 1
+            row = yield self.connection.ops.fetch_returned_insert_columns(
+                cursor, self.returning_params,
+            )
+            rows = [row]
+        else:
+            id = yield self.connection.ops.last_insert_id(
+                cursor, opts.db_table, opts.pk.column,
+            )
+            rows = [(id,)]
+
         cols = [field.get_col(opts.db_table) for field in self.returning_fields]
         converters = self.get_converters(cols)
         if converters:
@@ -1600,26 +1614,26 @@ class SQLUpdateCompiler(SQLCompiler):
             result.append('WHERE %s' % where)
         return ' '.join(result), tuple(update_params + params)
 
-    def execute_sql(self, result_type):
-        """
-        Execute the specified update. Return the number of rows affected by
-        the primary update query. The "primary update query" is the first
-        non-empty query that is executed. Row counts for any subsequent,
-        related queries are not available.
-        """
-        cursor = super().execute_sql(result_type)
-        try:
-            rows = cursor.rowcount if cursor else 0
-            is_empty = cursor is None
-        finally:
-            if cursor:
-                cursor.close()
-        for query in self.query.get_related_updates():
-            aux_rows = query.get_compiler(self.using).execute_sql(result_type)
-            if is_empty and aux_rows:
-                rows = aux_rows
-                is_empty = False
-        return rows
+    # def execute_sql(self, result_type):
+    #     """
+    #     Execute the specified update. Return the number of rows affected by
+    #     the primary update query. The "primary update query" is the first
+    #     non-empty query that is executed. Row counts for any subsequent,
+    #     related queries are not available.
+    #     """
+    #     cursor = super().execute_sql(result_type)
+    #     try:
+    #         rows = cursor.rowcount if cursor else 0
+    #         is_empty = cursor is None
+    #     finally:
+    #         if cursor:
+    #             cursor.close()
+    #     # for query in self.query.get_related_updates():
+    #     #     aux_rows = query.get_compiler(self.using).execute_sql(result_type)
+    #     #     if is_empty and aux_rows:
+    #     #         rows = aux_rows
+    #     #         is_empty = False
+    #     return rows
 
     def pre_sql_setup(self):
         """

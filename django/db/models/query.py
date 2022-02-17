@@ -1,7 +1,7 @@
 """
 The main QuerySet implementation. This provides the public API for the ORM.
 """
-
+import asyncio
 import copy
 import operator
 import warnings
@@ -22,6 +22,7 @@ from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE
 from django.db.models.utils import create_namedtuple_class, resolve_callables
+from django.pwt import then, wait, gen, later, gather
 from django.utils import timezone
 from django.utils.deprecation import RemovedInDjango50Warning
 from django.utils.functional import cached_property, partition
@@ -43,51 +44,8 @@ class BaseIterable:
 class ModelIterable(BaseIterable):
     """Iterable that yields a model instance for each row."""
 
-    def __iter__(self):
-        queryset = self.queryset
-        db = queryset.db
-        compiler = queryset.query.get_compiler(using=db)
-        # Execute the query. This will also fill compiler.select, klass_info,
-        # and annotations.
-        results = compiler.execute_sql(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)
-        select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,
-                                                  compiler.annotation_col_map)
-        model_cls = klass_info['model']
-        select_fields = klass_info['select_fields']
-        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
-        init_list = [f[0].target.attname
-                     for f in select[model_fields_start:model_fields_end]]
-        related_populators = get_related_populators(klass_info, select, db)
-        known_related_objects = [
-            (field, related_objs, operator.attrgetter(*[
-                field.attname
-                if from_field == 'self' else
-                queryset.model._meta.get_field(from_field).attname
-                for from_field in field.from_fields
-            ])) for field, related_objs in queryset._known_related_objects.items()
-        ]
-        for row in compiler.results_iter(results):
-            obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])
-            for rel_populator in related_populators:
-                rel_populator.populate(row, obj)
-            if annotation_col_map:
-                for attr_name, col_pos in annotation_col_map.items():
-                    setattr(obj, attr_name, row[col_pos])
-
-            # Add the known related objects to the model.
-            for field, rel_objs, rel_getter in known_related_objects:
-                # Avoid overwriting objects loaded by, e.g., select_related().
-                if field.is_cached(obj):
-                    continue
-                rel_obj_id = rel_getter(obj)
-                try:
-                    rel_obj = rel_objs[rel_obj_id]
-                except KeyError:
-                    pass  # May happen in qs1 | qs2 scenarios.
-                else:
-                    setattr(obj, field.name, rel_obj)
-
-            yield obj
+    #TODO move to QuerySet
+    pass
 
 
 class ValuesIterable(BaseIterable):
@@ -173,7 +131,7 @@ class FlatValuesListIterable(BaseIterable):
             yield row[0]
 
 
-class QuerySet:
+class _QuerySet:
     """Represent a lazy database lookup for a set of objects."""
 
     def __init__(self, model=None, query=None, using=None, hints=None):
@@ -461,20 +419,27 @@ class QuerySet:
         if not clone.query.select_for_update or connections[clone.db].features.supports_select_for_update_with_limit:
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
-        num = len(clone)
-        if num == 1:
-            return clone._result_cache[0]
-        if not num:
-            raise self.model.DoesNotExist(
-                "%s matching query does not exist." %
-                self.model._meta.object_name
+
+        _ = clone._fetch_all()
+
+        @wait
+        def run(_=_):
+            num = len(clone._result_cache)
+            if num == 1:
+                return clone._result_cache[0]
+            if not num:
+                raise self.model.DoesNotExist(
+                    "%s matching query does not exist." %
+                    self.model._meta.object_name
+                )
+            raise self.model.MultipleObjectsReturned(
+                'get() returned more than one %s -- it returned %s!' % (
+                    self.model._meta.object_name,
+                    num if not limit or num < limit else 'more than %s' % (limit - 1),
+                )
             )
-        raise self.model.MultipleObjectsReturned(
-            'get() returned more than one %s -- it returned %s!' % (
-                self.model._meta.object_name,
-                num if not limit or num < limit else 'more than %s' % (limit - 1),
-            )
-        )
+
+        return run()
 
     def create(self, **kwargs):
         """
@@ -483,8 +448,13 @@ class QuerySet:
         """
         obj = self.model(**kwargs)
         self._for_write = True
-        obj.save(force_insert=True, using=self.db)
-        return obj
+        _ = obj.save(force_insert=True, using=self.db)
+
+        @later
+        def create(_=_):
+            return obj
+
+        return create()
 
     def _prepare_for_bulk_create(self, objs):
         for obj in objs:
@@ -551,55 +521,58 @@ class QuerySet:
             return OnConflict.UPDATE
         return None
 
-    def bulk_create(
-        self, objs, batch_size=None, ignore_conflicts=False,
-        update_conflicts=False, update_fields=None, unique_fields=None,
-    ):
-        """
-        Insert each of the instances into the database. Do *not* call
-        save() on each of the instances, do not send any pre/post_save
-        signals, and do not set the primary key attribute if it is an
-        autoincrement field (except if features.can_return_rows_from_bulk_insert=True).
-        Multi-table models are not supported.
-        """
-        # When you bulk insert you don't get the primary keys back (if it's an
-        # autoincrement, except if can_return_rows_from_bulk_insert=True), so
-        # you can't insert into the child tables which references this. There
-        # are two workarounds:
-        # 1) This could be implemented if you didn't have an autoincrement pk
-        # 2) You could do it by doing O(n) normal inserts into the parent
-        #    tables to get the primary keys back and then doing a single bulk
-        #    insert into the childmost table.
-        # We currently set the primary keys on the objects when using
-        # PostgreSQL via the RETURNING ID clause. It should be possible for
-        # Oracle as well, but the semantics for extracting the primary keys is
-        # trickier so it's not done yet.
-        if batch_size is not None and batch_size <= 0:
-            raise ValueError('Batch size must be a positive integer.')
-        # Check that the parents share the same concrete model with the our
-        # model to detect the inheritance pattern ConcreteGrandParent ->
-        # MultiTableParent -> ProxyChild. Simply checking self.model._meta.proxy
-        # would not identify that case as involving multiple tables.
-        for parent in self.model._meta.get_parent_list():
-            if parent._meta.concrete_model is not self.model._meta.concrete_model:
-                raise ValueError("Can't bulk create a multi-table inherited model")
-        if not objs:
-            return objs
-        on_conflict = self._check_bulk_create_options(
-            ignore_conflicts,
-            update_conflicts,
-            update_fields,
-            unique_fields,
-        )
-        self._for_write = True
-        opts = self.model._meta
-        fields = opts.concrete_fields
-        objs = list(objs)
-        self._prepare_for_bulk_create(objs)
-        with transaction.atomic(using=self.db, savepoint=False):
+    @property
+    def bulk_create(self):
+        @transaction.atomic(using=self.db, savepoint=False)
+        @gen
+        def bulk_create(
+            objs, batch_size=None, ignore_conflicts=False,
+            update_conflicts=False, update_fields=None, unique_fields=None,
+        ):
+            """
+            Insert each of the instances into the database. Do *not* call
+            save() on each of the instances, do not send any pre/post_save
+            signals, and do not set the primary key attribute if it is an
+            autoincrement field (except if features.can_return_rows_from_bulk_insert=True).
+            Multi-table models are not supported.
+            """
+            # When you bulk insert you don't get the primary keys back (if it's an
+            # autoincrement, except if can_return_rows_from_bulk_insert=True), so
+            # you can't insert into the child tables which references this. There
+            # are two workarounds:
+            # 1) This could be implemented if you didn't have an autoincrement pk
+            # 2) You could do it by doing O(n) normal inserts into the parent
+            #    tables to get the primary keys back and then doing a single bulk
+            #    insert into the childmost table.
+            # We currently set the primary keys on the objects when using
+            # PostgreSQL via the RETURNING ID clause. It should be possible for
+            # Oracle as well, but the semantics for extracting the primary keys is
+            # trickier so it's not done yet.
+            if batch_size is not None and batch_size <= 0:
+                raise ValueError('Batch size must be a positive integer.')
+            # Check that the parents share the same concrete model with the our
+            # model to detect the inheritance pattern ConcreteGrandParent ->
+            # MultiTableParent -> ProxyChild. Simply checking self.model._meta.proxy
+            # would not identify that case as involving multiple tables.
+            for parent in self.model._meta.get_parent_list():
+                if parent._meta.concrete_model is not self.model._meta.concrete_model:
+                    raise ValueError("Can't bulk create a multi-table inherited model")
+            if not objs:
+                return objs
+            on_conflict = self._check_bulk_create_options(
+                ignore_conflicts,
+                update_conflicts,
+                update_fields,
+                unique_fields,
+            )
+            self._for_write = True
+            opts = self.model._meta
+            fields = opts.concrete_fields
+            objs = list(objs)
+            self._prepare_for_bulk_create(objs)
             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
             if objs_with_pk:
-                returned_columns = self._batched_insert(
+                returned_columns = yield from self._batched_insert(
                     objs_with_pk,
                     fields,
                     batch_size,
@@ -616,7 +589,7 @@ class QuerySet:
                     obj_with_pk._state.db = self.db
             if objs_without_pk:
                 fields = [f for f in fields if not isinstance(f, AutoField)]
-                returned_columns = self._batched_insert(
+                returned_columns = yield from self._batched_insert(
                     objs_without_pk,
                     fields,
                     batch_size,
@@ -633,57 +606,73 @@ class QuerySet:
                     obj_without_pk._state.adding = False
                     obj_without_pk._state.db = self.db
 
-        return objs
+            return objs
 
-    def bulk_update(self, objs, fields, batch_size=None):
-        """
-        Update the given fields in each of the given objects in the database.
-        """
-        if batch_size is not None and batch_size < 0:
-            raise ValueError('Batch size must be a positive integer.')
-        if not fields:
-            raise ValueError('Field names must be given to bulk_update().')
-        objs = tuple(objs)
-        if any(obj.pk is None for obj in objs):
-            raise ValueError('All bulk_update() objects must have a primary key set.')
-        fields = [self.model._meta.get_field(name) for name in fields]
-        if any(not f.concrete or f.many_to_many for f in fields):
-            raise ValueError('bulk_update() can only be used with concrete fields.')
-        if any(f.primary_key for f in fields):
-            raise ValueError('bulk_update() cannot be used with primary key fields.')
-        if not objs:
-            return 0
-        for obj in objs:
-            obj._prepare_related_fields_for_save(operation_name='bulk_update', fields=fields)
-        # PK is used twice in the resulting update query, once in the filter
-        # and once in the WHEN. Each field will also have one CAST.
-        connection = connections[self.db]
-        max_batch_size = connection.ops.bulk_batch_size(['pk', 'pk'] + fields, objs)
-        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
-        requires_casting = connection.features.requires_casted_case_in_updates
-        batches = (objs[i:i + batch_size] for i in range(0, len(objs), batch_size))
-        updates = []
-        for batch_objs in batches:
-            update_kwargs = {}
-            for field in fields:
-                when_statements = []
-                for obj in batch_objs:
-                    attr = getattr(obj, field.attname)
-                    if not hasattr(attr, 'resolve_expression'):
-                        attr = Value(attr, output_field=field)
-                    when_statements.append(When(pk=obj.pk, then=attr))
-                case_statement = Case(*when_statements, output_field=field)
-                if requires_casting:
-                    case_statement = Cast(case_statement, output_field=field)
-                update_kwargs[field.attname] = case_statement
-            updates.append(([obj.pk for obj in batch_objs], update_kwargs))
-        rows_updated = 0
-        with transaction.atomic(using=self.db, savepoint=False):
-            for pks, update_kwargs in updates:
-                rows_updated += self.filter(pk__in=pks).update(**update_kwargs)
-        return rows_updated
-    bulk_update.alters_data = True
+        return bulk_create
 
+    @property
+    def bulk_update(self):
+        @transaction.atomic(using=self.db, savepoint=False)
+        def bulk_update(objs, fields, batch_size=None):
+            """
+            Update the given fields in each of the given objects in the database.
+            """
+            if batch_size is not None and batch_size < 0:
+                raise ValueError('Batch size must be a positive integer.')
+            if not fields:
+                raise ValueError('Field names must be given to bulk_update().')
+            objs = tuple(objs)
+            if any(obj.pk is None for obj in objs):
+                raise ValueError('All bulk_update() objects must have a primary key set.')
+            fields = [self.model._meta.get_field(name) for name in fields]
+            if any(not f.concrete or f.many_to_many for f in fields):
+                raise ValueError('bulk_update() can only be used with concrete fields.')
+            if any(f.primary_key for f in fields):
+                raise ValueError('bulk_update() cannot be used with primary key fields.')
+            if not objs:
+                return 0
+            for obj in objs:
+                obj._prepare_related_fields_for_save(operation_name='bulk_update', fields=fields)
+            # PK is used twice in the resulting update query, once in the filter
+            # and once in the WHEN. Each field will also have one CAST.
+            connection = connections[self.db]
+            max_batch_size = connection.ops.bulk_batch_size(['pk', 'pk'] + fields, objs)
+            batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+            requires_casting = connection.features.requires_casted_case_in_updates
+            batches = (objs[i:i + batch_size] for i in range(0, len(objs), batch_size))
+            updates = []
+            for batch_objs in batches:
+                update_kwargs = {}
+                for field in fields:
+                    when_statements = []
+                    for obj in batch_objs:
+                        attr = getattr(obj, field.attname)
+                        if not hasattr(attr, 'resolve_expression'):
+                            attr = Value(attr, output_field=field)
+                        when_statements.append(When(pk=obj.pk, then=attr))
+                    case_statement = Case(*when_statements, output_field=field)
+                    if requires_casting:
+                        case_statement = Cast(case_statement, output_field=field)
+                    update_kwargs[field.attname] = case_statement
+                updates.append(([obj.pk for obj in batch_objs], update_kwargs))
+
+            qs_list = (
+                self.filter(pk__in=pks).update(**update_kwargs)
+                for pks, update_kwargs in updates
+            )
+            updated = gather(*qs_list)
+
+            @later
+            def bulk_update(rows=updated):
+                count = 0
+                for rows_updates in rows:
+                    count += rows_updates
+                return count
+
+            return bulk_update()
+        return bulk_update
+
+    @gen
     def get_or_create(self, defaults=None, **kwargs):
         """
         Look up an object with the given kwargs, creating one if necessary.
@@ -694,40 +683,44 @@ class QuerySet:
         # to avoid potential transaction consistency problems.
         self._for_write = True
         try:
-            return self.get(**kwargs), False
+            return (yield self.get(**kwargs), False)
         except self.model.DoesNotExist:
             params = self._extract_model_params(defaults, **kwargs)
             # Try to create an object using passed params.
             try:
-                with transaction.atomic(using=self.db):
-                    params = dict(resolve_callables(params))
-                    return self.create(**params), True
+                params = dict(resolve_callables(params))
+                return (yield self.create(**params), True)
             except IntegrityError:
                 try:
-                    return self.get(**kwargs), False
+                    return (yield self.get(**kwargs), False)
                 except self.model.DoesNotExist:
                     pass
                 raise
 
-    def update_or_create(self, defaults=None, **kwargs):
+    @property
+    def update_or_create(self):
         """
         Look up an object with the given kwargs, updating one with defaults
         if it exists, otherwise create a new one.
         Return a tuple (object, created), where created is a boolean
         specifying whether an object was created.
         """
-        defaults = defaults or {}
-        self._for_write = True
-        with transaction.atomic(using=self.db):
+        @transaction.atomic(using=self.db)
+        @gen
+        def update_or_create(defaults=None, **kwargs):
+            defaults = defaults or {}
+            self._for_write = True
             # Lock the row so that a concurrent update is blocked until
             # update_or_create() has performed its save.
-            obj, created = self.select_for_update().get_or_create(defaults, **kwargs)
+            obj, created = yield self.select_for_update().get_or_create(defaults, **kwargs)
             if created:
                 return obj, created
             for k, v in resolve_callables(defaults):
                 setattr(obj, k, v)
-            obj.save(using=self.db)
-        return obj, False
+            yield obj.save(using=self.db)
+            return obj, False
+
+        return update_or_create
 
     def _extract_model_params(self, defaults, **kwargs):
         """
@@ -876,10 +869,12 @@ class QuerySet:
         query = self.query.clone()
         query.__class__ = sql.DeleteQuery
         cursor = query.get_compiler(using).execute_sql(CURSOR)
-        if cursor:
-            with cursor:
-                return cursor.rowcount
-        return 0
+
+        @later
+        def rowcount(cursor=cursor):
+            return cursor.rowcount
+
+        return rowcount()
     _raw_delete.alters_data = True
 
     def update(self, **kwargs):
@@ -895,10 +890,14 @@ class QuerySet:
         query.add_update_values(kwargs)
         # Clear any annotations so that they won't be present in subqueries.
         query.annotations = {}
-        with transaction.mark_for_rollback_on_error(using=self.db):
-            rows = query.get_compiler(self.db).execute_sql(CURSOR)
-        self._result_cache = None
-        return rows
+        # with transaction.mark_for_rollback_on_error(using=self.db):
+        cursor = query.get_compiler(self.db).execute_sql(CURSOR)
+
+        @wait
+        def run(cursor=cursor):
+            self._result_cache = None
+            return cursor.rowcount
+        return run()
     update.alters_data = True
 
     def _update(self, values):
@@ -915,14 +914,20 @@ class QuerySet:
         # Clear any annotations so that they won't be present in subqueries.
         query.annotations = {}
         self._result_cache = None
-        return query.get_compiler(self.db).execute_sql(CURSOR)
+        cursor = query.get_compiler(self.db).execute_sql(CURSOR)
+
+        @then
+        def do(cursor=cursor):
+            return cursor.rowcount
+        return do()
     _update.alters_data = True
     _update.queryset_only = False
 
     def exists(self):
         if self._result_cache is None:
             return self.query.has_results(using=self.db)
-        return bool(self._result_cache)
+        ret = bool(self._result_cache)
+        return wait.value(ret)
 
     def contains(self, obj):
         """Return True if the queryset contains an object."""
@@ -946,8 +951,14 @@ class QuerySet:
 
     def _prefetch_related_objects(self):
         # This method can only be called once the result cache has been filled.
-        prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
-        self._prefetch_done = True
+        querysets = prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
+
+        @then
+        def run(_=querysets):
+            #TODO move to _fetch_all
+            self._prefetch_done = True
+
+        return run()
 
     def explain(self, *, format=None, **options):
         return self.query.explain(using=self.db, format=format, **options)
@@ -1433,12 +1444,13 @@ class QuerySet:
         bulk_return = connection.features.can_return_rows_from_bulk_insert
         for item in [objs[i:i + batch_size] for i in range(0, len(objs), batch_size)]:
             if bulk_return and on_conflict is None:
-                inserted_rows.extend(self._insert(
+                rows = yield self._insert(
                     item, fields=fields, using=self.db,
                     returning_fields=self.model._meta.db_returning_fields,
-                ))
+                )
+                inserted_rows.extend(rows)
             else:
-                self._insert(
+                yield self._insert(
                     item,
                     fields=fields,
                     using=self.db,
@@ -1473,11 +1485,11 @@ class QuerySet:
         c._fields = self._fields
         return c
 
-    def _fetch_all(self):
-        if self._result_cache is None:
-            self._result_cache = list(self._iterable_class(self))
-        if self._prefetch_related_lookups and not self._prefetch_done:
-            self._prefetch_related_objects()
+    # def _fetch_all(self):
+    #     if self._result_cache is None:
+    #         self._result_cache = list(self._iterable_class(self))
+    #     if self._prefetch_related_lookups and not self._prefetch_done:
+    #         self._prefetch_related_objects()
 
     def _next_is_sticky(self):
         """
@@ -1559,6 +1571,13 @@ class QuerySet:
             raise TypeError(f'Cannot use {operator_} operator with combined queryset.')
 
 
+from django.db.models.qs import QsMixin
+
+
+class QuerySet(QsMixin, _QuerySet):
+    pass
+
+
 class InstanceCheckMeta(type):
     def __instancecheck__(self, instance):
         return isinstance(instance, QuerySet) and instance.query.is_empty()
@@ -1624,11 +1643,11 @@ class RawQuerySet:
         c._prefetch_related_lookups = self._prefetch_related_lookups[:]
         return c
 
-    def _fetch_all(self):
-        if self._result_cache is None:
-            self._result_cache = list(self.iterator())
-        if self._prefetch_related_lookups and not self._prefetch_done:
-            self._prefetch_related_objects()
+    # def _fetch_all(self):
+    #     if self._result_cache is None:
+    #         self._result_cache = list(self.iterator())
+    #     if self._prefetch_related_lookups and not self._prefetch_done:
+    #         self._prefetch_related_objects()
 
     def __len__(self):
         self._fetch_all()
@@ -1793,7 +1812,7 @@ def normalize_prefetch_lookups(lookups, prefix=None):
         ret.append(lookup)
     return ret
 
-
+@gen
 def prefetch_related_objects(model_instances, *related_lookups):
     """
     Populate prefetched object caches for a list of model instances based on
@@ -1882,7 +1901,7 @@ def prefetch_related_objects(model_instances, *related_lookups):
                 obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
 
             if obj_to_fetch:
-                obj_list, additional_lookups = prefetch_one_level(
+                obj_list, additional_lookups = yield from prefetch_one_level(
                     obj_to_fetch,
                     prefetcher,
                     lookup,
@@ -2024,7 +2043,8 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
         # for performance reasons.
         rel_qs._prefetch_related_lookups = ()
 
-    all_related_objects = list(rel_qs)
+    yield rel_qs
+    all_related_objects = rel_qs._result_cache
 
     rel_obj_cache = {}
     for rel_obj in all_related_objects:

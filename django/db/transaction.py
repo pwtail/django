@@ -1,8 +1,9 @@
-from contextlib import ContextDecorator, contextmanager
+from contextlib import ContextDecorator, contextmanager, asynccontextmanager
 
 from django.db import (
-    DEFAULT_DB_ALIAS, DatabaseError, Error, ProgrammingError, connections,
+    DEFAULT_DB_ALIAS, DatabaseError, Error, ProgrammingError, connections, connection,
 )
+from django.pwt import Branch
 
 
 class TransactionManagementError(ProgrammingError):
@@ -304,6 +305,9 @@ class Atomic(ContextDecorator):
                     connection.in_atomic_block = False
 
 
+branch = Branch.Wrapper()
+
+@branch
 def atomic(using=None, savepoint=True, durable=False):
     # Bare decorator: @atomic -- although the first argument is called
     # `using`, it's actually the function being decorated.
@@ -312,6 +316,19 @@ def atomic(using=None, savepoint=True, durable=False):
     # Decorator: @atomic(...) or context manager: with atomic(...): ...
     else:
         return Atomic(using, savepoint, durable)
+
+
+@branch(type='async', name='atomic')
+@asynccontextmanager
+async def atomic(using=None, savepoint=True, durable=False):
+    if connection.async_pool is None:
+        await connection.start_pool()
+    async with connection.async_pool.connection() as conn:
+        token = connection.async_connection.set(conn)
+        try:
+            yield conn.transaction()
+        finally:
+            connection.async_connection.reset(token)
 
 
 def _non_atomic_requests(view, using):

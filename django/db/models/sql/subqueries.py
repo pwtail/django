@@ -1,6 +1,7 @@
 """
 Query subclasses which provide extra functionality beyond simple data retrieval.
 """
+import asyncio
 
 from django.core.exceptions import FieldError
 from django.db.models.sql.constants import (
@@ -9,6 +10,8 @@ from django.db.models.sql.constants import (
 from django.db.models.sql.query import Query
 
 __all__ = ['DeleteQuery', 'UpdateQuery', 'InsertQuery', 'AggregateQuery']
+
+from django.pwt import later, gather
 
 
 class DeleteQuery(Query):
@@ -20,10 +23,12 @@ class DeleteQuery(Query):
         self.alias_map = {table: self.alias_map[table]}
         self.where = where
         cursor = self.get_compiler(using).execute_sql(CURSOR)
-        if cursor:
-            with cursor:
-                return cursor.rowcount
-        return 0
+
+        @later
+        def do_query(cursor=cursor):
+            return cursor.rowcount
+
+        return do_query()
 
     def delete_batch(self, pk_list, using):
         """
@@ -32,17 +37,24 @@ class DeleteQuery(Query):
         More than one physical query may be executed if there are a
         lot of values in pk_list.
         """
-        # number of objects deleted
-        num_deleted = 0
         field = self.get_meta().pk
+        tasks = []
         for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE):
             self.clear_where()
             self.add_filter(
                 f'{field.attname}__in',
                 pk_list[offset:offset + GET_ITERATOR_CHUNK_SIZE],
             )
-            num_deleted += self.do_query(self.get_meta().db_table, self.where, using=using)
-        return num_deleted
+            tasks.append(self.do_query(self.get_meta().db_table, self.where, using=using))
+
+        @later
+        def delete_batch(rows=gather(*tasks)):
+            count = 0
+            for rows_deleted in rows:
+                count += rows_deleted
+            return count
+
+        return delete_batch()
 
 
 class UpdateQuery(Query):
@@ -70,10 +82,14 @@ class UpdateQuery(Query):
 
     def update_batch(self, pk_list, values, using):
         self.add_update_values(values)
+        tasks = []
         for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE):
             self.clear_where()
             self.add_filter('pk__in', pk_list[offset: offset + GET_ITERATOR_CHUNK_SIZE])
-            self.get_compiler(using).execute_sql(NO_RESULTS)
+            t = self.get_compiler(using).execute_sql(NO_RESULTS)
+            tasks.append(t)
+
+        return gather(*tasks)
 
     def add_update_values(self, values):
         """

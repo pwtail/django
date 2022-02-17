@@ -4,7 +4,10 @@ import threading
 import time
 import warnings
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
+from contextvars import ContextVar
+
+from django.pwt import is_async
 
 try:
     import zoneinfo
@@ -56,10 +59,46 @@ class BaseDatabaseWrapper:
 
     queries_limit = 9000
 
+
+    def cursor_decorator(self, fn):
+        async def awrapper(*args, **kwargs):
+            async with self.cursor() as cursor:
+                return await fn(*args, cursor=cursor, **kwargs)
+
+        def wrapper(*args, **kwargs):
+            if not is_async():
+                with self.cursor() as cursor:
+                    return fn(*args, cursor=cursor, **kwargs)
+            return awrapper(*args, **kwargs)
+
+        return wrapper
+
+    def cursor(self, fn=None):
+        if callable(fn):
+            return self.cursor_decorator(fn)
+        if not is_async():
+            return self.get_cursor()
+
+        #TODO give a warning if connection is active and asking for connection
+
+        @asynccontextmanager
+        async def cursor():
+            if self.async_pool is None:
+                await self.start_pool()
+            if (conn := self.async_connection.get()) is not None:
+                async with conn.cursor() as cur:
+                    yield cur
+                return
+            async with self.async_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    yield cur
+
+        return cursor()
+
     def __init__(self, settings_dict, alias=DEFAULT_DB_ALIAS):
         # Connection related attributes.
         # The underlying database connection.
-        self.connection = None
+        # self.connection = None
         # `settings_dict` should be a dictionary containing keys such as
         # NAME, USER, etc. It's called `settings_dict` instead of `settings`
         # to disambiguate it from Django settings modules.
@@ -121,6 +160,9 @@ class BaseDatabaseWrapper:
         self.introspection = self.introspection_class(self)
         self.ops = self.ops_class(self)
         self.validation = self.validation_class(self)
+
+        self.connection = None
+        self.async_connection = ContextVar('async_connection', default=None)
 
     def __repr__(self):
         return (
@@ -280,7 +322,7 @@ class BaseDatabaseWrapper:
     # ##### Generic wrappers for PEP-249 connection methods #####
 
     @async_unsafe
-    def cursor(self):
+    def get_cursor(self):
         """Create a cursor, opening a connection if necessary."""
         return self._cursor()
 
