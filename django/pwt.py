@@ -34,7 +34,10 @@ def later(fn):
 
     async def awrapper(*args, **kwargs):
         for key, val in awaitables:
-            kwargs[key] = await val
+            try:
+                kwargs[key] = await val
+            except Exception as ex:
+                kwargs[key] = ex
         val = fn(*args, **kwargs)
         if isinstance(val, typing.Awaitable):
             val = await val
@@ -162,3 +165,20 @@ class Branch:
     Wrapper = BranchWrapper
     Descriptor = BranchDescriptor
 
+
+class LazyObject(typing.NamedTuple):
+    fn: function
+    args: tuple
+    kwargs: dict
+
+    def __await__(self):
+        (fn, args, kw) = self
+        return fn(*args, **kw).__await__()
+
+def lazyobj(fn):
+    def wrapper(*args, **kw):
+        if not is_async():
+            return fn(*args, **kw)
+        return LazyObject(fn, args, kw)
+
+    return wrapper
